@@ -67,7 +67,7 @@ bash build_standalone.sh /path/to/mame0286 [output-dir]
 ```
 
 Binary: statically linked, no runtime dependencies. Runs on any x86-64 Windows.
-SIMD paths (SSSE3 / AVX2 / SHA-NI) are compiled in and dispatched at runtime via CPUID.
+SIMD paths (SSE2 / SSSE3 / AVX2 / SHA-NI) are compiled in and dispatched at runtime via CPUID.
 
 #### B2 — Clang / LLD (MSYS2, MinGW ABI)
 
