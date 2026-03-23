@@ -1,0 +1,402 @@
+# chdman standalone - MSYS2/MinGW64
+# Run from the standalone output directory (created by build_standalone.sh)
+# Build command: mingw32-make -j$(nproc)
+#
+# Prerequisites (MSYS2/MinGW64):
+#   pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-cmake
+#   pacman -S mingw-w64-x86_64-uasm   # optional — enables LZMA ASM decoder
+#
+# Run setup_zlibng.sh once before the first build.
+
+# Toolchain — use whatever g++/gcc is first in PATH.
+# If WinLibs and MSYS2 are both installed, ensure MSYS2 is first:
+#   export PATH=/c/msys64/mingw64/bin:$PATH
+CXX      := g++
+CC       := gcc
+AR       := ar
+
+# --- Assembler auto-detection: UASM > ml64 (Windows/VS) > disabled ---
+UASM_BIN := $(or $(wildcard C:/msys64/mingw64/bin/uasm.exe), $(shell which uasm 2>/dev/null || which uasm.exe 2>/dev/null))
+ML64_BIN  := C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/ml64.exe
+
+ifeq ($(OS),Windows_NT)
+  ASM_ABI  =
+else
+  ASM_ABI  = -DABI_LINUX
+endif
+
+ifneq ($(UASM_BIN),)
+  HAVE_LZMA_ASM := 1
+  ASM_COMPILE    = $(UASM_BIN) -win64 -c $(ASM_ABI) -Fo$@ $<
+else ifeq ($(OS),Windows_NT)
+  ifneq ($(wildcard $(ML64_BIN)),)
+    HAVE_LZMA_ASM := 1
+    ASM_COMPILE    = "$(ML64_BIN)" /nologo /c /Fo$(subst /,\,$@) $(subst /,\,$<)
+  endif
+endif
+
+TP       = 3rdparty
+comma    := ,
+S        = src
+BUILDDIR = build/obj
+TARGET   = chdman.exe
+UTIL_SHA1_USE_SSE2 ?= 1
+
+# zlib-ng (ZLIB_COMPAT=ON) — run setup_zlibng.sh once before building
+ZLIBNG_BUILD = 3rdparty_extra/zlib-ng-2.3.3/build
+
+# MARCH_BASE: minimum SSE2 — binary runs on all x86-64 CPUs.
+# SIMD paths (SSSE3/AVX2/SHA-NI/FMA) are compiled per-file below and
+# activated at runtime via CPUID dispatch. Set MARCH_BASE=native to
+# optimize for the build machine instead.
+MARCH_BASE ?= -march=x86-64 -msse2 -mtune=generic
+
+CXXFLAGS = -std=c++17 -O3 $(MARCH_BASE) -g -DUTIL_SHA1_USE_SSE2=$(UTIL_SHA1_USE_SSE2) -DLSB_FIRST \
+    -DHAVE_LZMA_ASM=$(or $(HAVE_LZMA_ASM),0) \
+    -I$(S)/emu \
+    -I$(S)/osd \
+    -I$(S)/osd/windows \
+    -I$(S)/osd/modules/file \
+    -I$(S)/lib \
+    -I$(S)/lib/util \
+    -I$(TP) \
+    -I$(TP)/lzma/C \
+    -I$(TP)/utf8proc \
+    -I$(TP)/expat/lib \
+    -I$(ZLIBNG_BUILD) \
+    -I$(TP)/zstd/lib \
+    -I$(TP)/flac/include \
+    -I$(TP)/flac/src/libFLAC/include \
+    -DUTF8PROC_STATIC \
+    -DFLAC__NO_DLL \
+    -DCRLF=3 \
+    -DOSD_WINDOWS \
+    -DX64_WINDOWS_ABI \
+    -DUNICODE -D_UNICODE \
+    -D_WIN32_WINNT=0x0501 \
+    -DWIN32_LEAN_AND_MEAN \
+    -DNOMINMAX \
+    -fpermissive \
+    -Wall -Wextra
+
+EXTRA_CXXFLAGS ?=
+CXXFLAGS += $(EXTRA_CXXFLAGS)
+
+EXTRA_CFLAGS ?=
+CFLAGS += $(EXTRA_CFLAGS)
+
+# Redirect warnings to build.log — keeps terminal output clean.
+# Errors still appear on stderr.
+LOG      = build/build.log
+WARN_LOG = 2>>$(LOG)
+
+CFLAGS = -O3 $(MARCH_BASE) -g \
+    -I$(TP)/lzma/C \
+    -I$(TP)/utf8proc \
+    -I$(TP)/expat/lib \
+    -I$(ZLIBNG_BUILD) \
+    -I$(TP)/zstd/lib \
+    -I$(TP)/flac/include \
+    -I$(TP)/flac/src/libFLAC/include \
+    -DXML_GE=1 -DXML_CONTEXT_BYTES=1024 -DUTF8PROC_STATIC -DZ7_ST \
+    -DZLIB_CONST \
+    -DXXH_NAMESPACE=ZSTD_ -DDEBUGLEVEL=0 -DZSTD_DISABLE_ASM \
+    -DFLAC__NO_DLL -DNDEBUG -DHAVE_CONFIG_H -DENABLE_64_BIT_WORDS=1 \
+    -DOGG_FOUND=0 -DFLAC__HAS_OGG=0 -DHAVE_LROUND=1 \
+    -DHAVE_INTTYPES_H -DHAVE_STDBOOL_H -DHAVE_FSEEKO \
+    -DFLAC__USE_AVX \
+    -Wall -Wextra
+
+LDFLAGS = -static -static-libstdc++ -static-libgcc -s \
+    -lws2_32 -lwinmm -ladvapi32 -lshlwapi -lpsapi -liphlpapi -lshell32 -luserenv -lm \
+    $(if $(HAVE_LZMA_ASM),-Wl$(comma)--allow-multiple-definition) \
+    $(ZLIBNG_BUILD)/libz.a
+
+# ---------------------------------------------------------------------------
+# C++ sources
+# ---------------------------------------------------------------------------
+
+MAIN_SRCS = \
+    $(S)/tools/chdman.cpp \
+    $(S)/version.cpp
+
+UTIL_SRCS = \
+    $(S)/lib/util/aes256cbc.cpp \
+    $(S)/lib/util/avhuff.cpp \
+    $(S)/lib/util/aviio.cpp \
+    $(S)/lib/util/bitmap.cpp \
+    $(S)/lib/util/cdrom.cpp \
+    $(S)/lib/util/chd.cpp \
+    $(S)/lib/util/chdcodec.cpp \
+    $(S)/lib/util/corealloc.cpp \
+    $(S)/lib/util/corefile.cpp \
+    $(S)/lib/util/corestr.cpp \
+    $(S)/lib/util/coreutil.cpp \
+    $(S)/lib/util/delegate.cpp \
+    $(S)/lib/util/disasmintf.cpp \
+    $(S)/lib/util/dvdrom.cpp \
+    $(S)/lib/util/dynamicclass.cpp \
+    $(S)/lib/util/flac.cpp \
+    $(S)/lib/util/harddisk.cpp \
+    $(S)/lib/util/hash.cpp \
+    $(S)/lib/util/hashing.cpp \
+    $(S)/lib/util/huffman.cpp \
+    $(S)/lib/util/ioprocs.cpp \
+    $(S)/lib/util/ioprocsfilter.cpp \
+    $(S)/lib/util/jedparse.cpp \
+    $(S)/lib/util/language.cpp \
+    $(S)/lib/util/md5.cpp \
+    $(S)/lib/util/mfpresolve.cpp \
+    $(S)/lib/util/msdib.cpp \
+    $(S)/lib/util/nanosvg.cpp \
+    $(S)/lib/util/opresolv.cpp \
+    $(S)/lib/util/options.cpp \
+    $(S)/lib/util/palette.cpp \
+    $(S)/lib/util/path.cpp \
+    $(S)/lib/util/path_to_regex.cpp \
+    $(S)/lib/util/plaparse.cpp \
+    $(S)/lib/util/png.cpp \
+    $(S)/lib/util/simh_tape_file.cpp \
+    $(S)/lib/util/strformat.cpp \
+    $(S)/lib/util/timeconv.cpp \
+    $(S)/lib/util/unicode.cpp \
+    $(S)/lib/util/unzip.cpp \
+    $(S)/lib/util/un7z.cpp \
+    $(S)/lib/util/vbiparse.cpp \
+    $(S)/lib/util/vecstream.cpp \
+    $(S)/lib/util/wavwrite.cpp \
+    $(S)/lib/util/xmlfile.cpp \
+    $(S)/lib/util/zippath.cpp
+
+OSD_SRCS = \
+    $(S)/osd/osdcore.cpp \
+    $(S)/osd/strconv.cpp \
+    $(S)/osd/osdsync.cpp \
+    $(S)/osd/modules/lib/osdlib_win32.cpp \
+    $(S)/osd/windows/winutf8.cpp \
+    $(S)/osd/modules/file/windir.cpp \
+    $(S)/osd/modules/file/winfile.cpp \
+    $(S)/osd/modules/file/winptty.cpp \
+    $(S)/osd/modules/file/winsocket.cpp \
+    $(S)/osd/windows/winutil.cpp
+
+# ---------------------------------------------------------------------------
+# C sources — 3rdparty compiled from source (no prebuilt .a required)
+# ---------------------------------------------------------------------------
+
+UTF8_CSRCS = \
+    $(TP)/utf8proc/utf8proc.c
+
+EXPAT_CSRCS = \
+    $(TP)/expat/lib/xmlparse.c \
+    $(TP)/expat/lib/xmlrole.c \
+    $(TP)/expat/lib/xmltok.c
+
+# LzmaDec.c is handled separately below (ASM override or C fallback)
+LZMA_CSRCS = \
+    $(TP)/lzma/C/7zAlloc.c \
+    $(TP)/lzma/C/7zArcIn.c \
+    $(TP)/lzma/C/7zBuf.c \
+    $(TP)/lzma/C/7zBuf2.c \
+    $(TP)/lzma/C/7zCrc.c \
+    $(TP)/lzma/C/7zCrcOpt.c \
+    $(TP)/lzma/C/7zDec.c \
+    $(TP)/lzma/C/7zFile.c \
+    $(TP)/lzma/C/7zStream.c \
+    $(TP)/lzma/C/Aes.c \
+    $(TP)/lzma/C/AesOpt.c \
+    $(TP)/lzma/C/Alloc.c \
+    $(TP)/lzma/C/Bcj2.c \
+    $(TP)/lzma/C/Bra.c \
+    $(TP)/lzma/C/Bra86.c \
+    $(TP)/lzma/C/BraIA64.c \
+    $(TP)/lzma/C/CpuArch.c \
+    $(TP)/lzma/C/Delta.c \
+    $(TP)/lzma/C/LzFind.c \
+    $(TP)/lzma/C/LzFindOpt.c \
+    $(TP)/lzma/C/Lzma2Dec.c \
+    $(TP)/lzma/C/LzmaEnc.c \
+    $(TP)/lzma/C/Ppmd7.c \
+    $(TP)/lzma/C/Ppmd7Dec.c \
+    $(TP)/lzma/C/Sha256.c \
+    $(TP)/lzma/C/Sha256Opt.c \
+    $(TP)/lzma/C/Sort.c
+
+ZSTD_CSRCS = \
+    $(TP)/zstd/lib/compress/hist.c \
+    $(TP)/zstd/lib/common/debug.c \
+    $(TP)/zstd/lib/common/entropy_common.c \
+    $(TP)/zstd/lib/common/error_private.c \
+    $(TP)/zstd/lib/common/fse_decompress.c \
+    $(TP)/zstd/lib/common/pool.c \
+    $(TP)/zstd/lib/common/threading.c \
+    $(TP)/zstd/lib/common/xxhash.c \
+    $(TP)/zstd/lib/common/zstd_common.c \
+    $(TP)/zstd/lib/compress/fse_compress.c \
+    $(TP)/zstd/lib/compress/huf_compress.c \
+    $(TP)/zstd/lib/compress/zstd_compress.c \
+    $(TP)/zstd/lib/compress/zstd_compress_literals.c \
+    $(TP)/zstd/lib/compress/zstd_compress_sequences.c \
+    $(TP)/zstd/lib/compress/zstd_compress_superblock.c \
+    $(TP)/zstd/lib/compress/zstd_double_fast.c \
+    $(TP)/zstd/lib/compress/zstd_fast.c \
+    $(TP)/zstd/lib/compress/zstd_lazy.c \
+    $(TP)/zstd/lib/compress/zstd_ldm.c \
+    $(TP)/zstd/lib/compress/zstdmt_compress.c \
+    $(TP)/zstd/lib/compress/zstd_opt.c \
+    $(TP)/zstd/lib/decompress/huf_decompress.c \
+    $(TP)/zstd/lib/decompress/zstd_ddict.c \
+    $(TP)/zstd/lib/decompress/zstd_decompress.c \
+    $(TP)/zstd/lib/decompress/zstd_decompress_block.c
+
+FLAC_CSRCS = \
+    $(TP)/flac/src/libFLAC/bitmath.c \
+    $(TP)/flac/src/libFLAC/bitreader.c \
+    $(TP)/flac/src/libFLAC/bitwriter.c \
+    $(TP)/flac/src/libFLAC/crc.c \
+    $(TP)/flac/src/libFLAC/cpu.c \
+    $(TP)/flac/src/libFLAC/fixed.c \
+    $(TP)/flac/src/libFLAC/fixed_intrin_avx2.c \
+    $(TP)/flac/src/libFLAC/fixed_intrin_sse2.c \
+    $(TP)/flac/src/libFLAC/fixed_intrin_sse42.c \
+    $(TP)/flac/src/libFLAC/fixed_intrin_ssse3.c \
+    $(TP)/flac/src/libFLAC/float.c \
+    $(TP)/flac/src/libFLAC/format.c \
+    $(TP)/flac/src/libFLAC/lpc.c \
+    $(TP)/flac/src/libFLAC/lpc_intrin_avx2.c \
+    $(TP)/flac/src/libFLAC/lpc_intrin_fma.c \
+    $(TP)/flac/src/libFLAC/lpc_intrin_neon.c \
+    $(TP)/flac/src/libFLAC/lpc_intrin_sse2.c \
+    $(TP)/flac/src/libFLAC/lpc_intrin_sse41.c \
+    $(TP)/flac/src/libFLAC/md5.c \
+    $(TP)/flac/src/libFLAC/memory.c \
+    $(TP)/flac/src/libFLAC/stream_decoder.c \
+    $(TP)/flac/src/libFLAC/stream_encoder.c \
+    $(TP)/flac/src/libFLAC/stream_encoder_framing.c \
+    $(TP)/flac/src/libFLAC/stream_encoder_intrin_avx2.c \
+    $(TP)/flac/src/libFLAC/stream_encoder_intrin_sse2.c \
+    $(TP)/flac/src/libFLAC/stream_encoder_intrin_ssse3.c \
+    $(TP)/flac/src/libFLAC/window.c \
+    $(TP)/flac/src/share/win_utf8_io/win_utf8_io.c
+
+# ---------------------------------------------------------------------------
+# Object lists
+# ---------------------------------------------------------------------------
+
+ALL_SRCS = $(MAIN_SRCS) $(UTIL_SRCS) $(OSD_SRCS)
+CXX_OBJS = $(addprefix $(BUILDDIR)/,$(patsubst %.cpp,%.o,$(ALL_SRCS)))
+
+ALL_CSRCS = $(UTF8_CSRCS) $(EXPAT_CSRCS) $(LZMA_CSRCS) $(ZSTD_CSRCS) $(FLAC_CSRCS)
+C_OBJS    = $(addprefix $(BUILDDIR)/,$(patsubst %.c,%.o,$(ALL_CSRCS)))
+
+ifeq ($(HAVE_LZMA_ASM),1)
+  # LzmaDec.c recompiled with Z7_LZMA_DEC_OPT (declares external ASM impl)
+  LZMA_OPT_OBJ   = $(BUILDDIR)/$(TP)/lzma/C/LzmaDec.OPT.o
+  LZMA_ASM_OBJ   = $(BUILDDIR)/$(TP)/lzma/Asm/x86/LzmaDecOpt.o
+  LZFIND_ASM_OBJ = $(BUILDDIR)/$(TP)/lzma/Asm/x86/LzFindOpt.o
+  $(info LZMA ASM decoder enabled ($(if $(UASM_BIN),uasm,ml64)))
+else
+  # LzmaDec.c compiled normally — C fallback
+  LZMA_OPT_OBJ   = $(BUILDDIR)/$(TP)/lzma/C/LzmaDec.o
+  LZMA_ASM_OBJ   =
+  LZFIND_ASM_OBJ =
+  $(info LZMA ASM decoder disabled - C fallback)
+endif
+
+OBJS = $(CXX_OBJS) $(LZMA_OPT_OBJ) $(LZMA_ASM_OBJ) $(LZFIND_ASM_OBJ) $(C_OBJS)
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+.PHONY: all clean check_zlibng
+
+all: check_zlibng $(TARGET)
+	@echo "Build complete: $(TARGET)"
+	@echo "Warnings saved to: $(LOG)"
+
+check_zlibng:
+	@test -f $(ZLIBNG_BUILD)/libz.a || \
+	  (echo "ERROR: zlib-ng not built. Run: bash setup_zlibng.sh" && exit 1)
+
+$(TARGET): $(OBJS)
+	$(CXX) $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILDDIR)/%.o: %.cpp
+	@mkdir -p $(dir $@) $(dir $(LOG))
+	$(CXX) $(CXXFLAGS) -c $< -o $@ $(WARN_LOG)
+
+$(BUILDDIR)/%.o: %.c
+	@mkdir -p $(dir $@) $(dir $(LOG))
+	$(CC) $(CFLAGS) -c $< -o $@ $(WARN_LOG)
+
+# ---------------------------------------------------------------------------
+# Per-file SIMD overrides — compile with required ISA flags so runtime
+# dispatch paths are compiled in even when MARCH_BASE=x86-64 (SSE2 only).
+# Each function is guarded by #if UTIL_SHA1_HAS_xxx / FLAC cpu detection,
+# so it is only called when CPUID confirms the feature is available.
+# ---------------------------------------------------------------------------
+
+# hashing.cpp: SSSE3 byte-swap + AVX2 byte-swap + SHA-NI rounds
+$(BUILDDIR)/$(S)/lib/util/hashing.o: $(S)/lib/util/hashing.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -mssse3 -mavx2 -msha -c $< -o $@ $(WARN_LOG)
+
+# FLAC AVX2 intrinsics
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/fixed_intrin_avx2.o: $(TP)/flac/src/libFLAC/fixed_intrin_avx2.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mavx2 -c $< -o $@ $(WARN_LOG)
+
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/lpc_intrin_avx2.o: $(TP)/flac/src/libFLAC/lpc_intrin_avx2.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mavx2 -c $< -o $@ $(WARN_LOG)
+
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/stream_encoder_intrin_avx2.o: $(TP)/flac/src/libFLAC/stream_encoder_intrin_avx2.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mavx2 -c $< -o $@ $(WARN_LOG)
+
+# FLAC FMA (requires AVX for ymm registers)
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/lpc_intrin_fma.o: $(TP)/flac/src/libFLAC/lpc_intrin_fma.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mavx2 -mfma -c $< -o $@ $(WARN_LOG)
+
+# FLAC SSE4.2
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/fixed_intrin_sse42.o: $(TP)/flac/src/libFLAC/fixed_intrin_sse42.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -msse4.2 -c $< -o $@ $(WARN_LOG)
+
+# FLAC SSE4.1
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/lpc_intrin_sse41.o: $(TP)/flac/src/libFLAC/lpc_intrin_sse41.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -msse4.1 -c $< -o $@ $(WARN_LOG)
+
+# FLAC SSSE3
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/fixed_intrin_ssse3.o: $(TP)/flac/src/libFLAC/fixed_intrin_ssse3.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mssse3 -c $< -o $@ $(WARN_LOG)
+
+$(BUILDDIR)/$(TP)/flac/src/libFLAC/stream_encoder_intrin_ssse3.o: $(TP)/flac/src/libFLAC/stream_encoder_intrin_ssse3.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -mssse3 -c $< -o $@ $(WARN_LOG)
+
+# LzmaDec.c — special rules (ASM path or C fallback)
+ifeq ($(HAVE_LZMA_ASM),1)
+$(LZMA_OPT_OBJ): $(TP)/lzma/C/LzmaDec.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DZ7_LZMA_DEC_OPT -c $< -o $@ $(WARN_LOG)
+
+$(LZMA_ASM_OBJ): $(TP)/lzma/Asm/x86/LzmaDecOpt.asm
+	@mkdir -p $(dir $@)
+	$(ASM_COMPILE)
+
+$(LZFIND_ASM_OBJ): $(TP)/lzma/Asm/x86/LzFindOpt.asm
+	@mkdir -p $(dir $@)
+	$(ASM_COMPILE)
+else
+$(LZMA_OPT_OBJ): $(TP)/lzma/C/LzmaDec.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@ $(WARN_LOG)
+endif
+
+clean:
+	rm -rf $(BUILDDIR) $(TARGET)
