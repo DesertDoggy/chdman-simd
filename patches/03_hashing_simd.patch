@@ -1,0 +1,892 @@
+--- a/src/lib/util/hashing.cpp	2026-02-25 07:49:26.000000000 +0100
++++ b/src/lib/util/hashing.cpp	2026-03-15 00:02:37.881597400 +0100
+@@ -17,9 +17,15 @@
+ #include <zlib.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <iomanip>
++#include <mutex>
+ #include <sstream>
+ 
++#ifndef UTIL_SHA1_USE_SSE2
++#define UTIL_SHA1_USE_SSE2 0
++#endif
++
+ 
+ namespace util {
+ 
+@@ -63,7 +69,7 @@
+ 
+ inline void sha1_r1(uint32_t *data, std::array<uint32_t, 5> &d, unsigned i) noexcept
+ {
+-	d[i % 5] = d[i % 5] + ((d[(i + 3) % 5] & (d[(i + 2) % 5] ^ d[(i + 1) % 5])) ^ d[(i + 1) % 5])+ sha1_b(data, i) + 0x5a827999U + rotl_32(d[(i + 4) % 5], 5);
++	d[i % 5] = d[i % 5] + ((d[(i + 3) % 5] & (d[(i + 2) % 5] ^ d[(i + 1) % 5])) ^ d[(i + 1) % 5]) + sha1_b(data, i) + 0x5a827999U + rotl_32(d[(i + 4) % 5], 5);
+ 	d[(i + 3) % 5] = rotl_32(d[(i + 3) % 5], 30);
+ }
+ 
+@@ -85,7 +91,8 @@
+ 	d[(i + 3) % 5] = rotl_32(d[(i + 3) % 5], 30);
+ }
+ 
+-inline void sha1_process(std::array<uint32_t, 5> &st, uint32_t *data) noexcept
++// version scalaire d'origine
++inline void sha1_process_scalar(std::array<uint32_t, 5> &st, uint32_t *data) noexcept
+ {
+ 	std::array<uint32_t, 5> d = st;
+ 	unsigned i = 0U;
+@@ -103,6 +110,683 @@
+ 		st[i] += d[i];
+ }
+ 
++#if UTIL_SHA1_USE_SSE2 && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
++#include <emmintrin.h>
++#if defined(_MSC_VER)
++#include <intrin.h>
++#endif
++#if defined(__GNUC__)
++#include <cpuid.h>
++#endif
++#if defined(__SSSE3__)
++#include <tmmintrin.h>
++#endif
++#if defined(__SSE4_1__)
++#include <smmintrin.h>
++#endif
++#if defined(__AVX2__) || defined(__SHA__)
++#include <immintrin.h>
++#endif
++
++#if defined(__SSSE3__)
++#define UTIL_SHA1_HAS_SSSE3 1
++#else
++#define UTIL_SHA1_HAS_SSSE3 0
++#endif
++#if defined(__AVX2__)
++#define UTIL_SHA1_HAS_AVX2 1
++#else
++#define UTIL_SHA1_HAS_AVX2 0
++#endif
++#if defined(__SHA__)
++#define UTIL_SHA1_HAS_SHA_NI 1
++#else
++#define UTIL_SHA1_HAS_SHA_NI 0
++#endif
++
++// ---------------------------------------------------------------------------
++// SHA-1 SSE2 message schedule
++//
++// True 4-wide SSE2: computes four W words at once using 128-bit XMM registers.
++// The round function itself stays scalar because SHA-1 has a serial dependency
++// chain (a→b→c→d→e) that cannot be vectorised across rounds.
++//
++// Algorithm: W[i] = rol(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16], 1)
++//
++// Each XMM register holds 4 consecutive 32-bit words:
++//   w0 = [W[i-16], W[i-15], W[i-14], W[i-13]]   (lane 0 = lowest index)
++//   w1 = [W[i-12], W[i-11], W[i-10], W[i-9 ]]
++//   w2 = [W[i-8 ], W[i-7 ], W[i-6 ], W[i-5 ]]
++//   w3 = [W[i-4 ], W[i-3 ], W[i-2 ], W[i-1 ]]
++// Returns [W[i], W[i+1], W[i+2], W[i+3]].
++//
++// Note on W[i+3]: it depends on W[i] (which we just computed), so a one-shot
++// ROTL1 of the XOR leaves lane 3 incomplete. We fix it afterwards with a
++// second targeted ROTL1 on lane 0 shifted into lane 3.
++// ---------------------------------------------------------------------------
++
++// ROTL1 on all four 32-bit lanes simultaneously.
++static inline __m128i sha1_rotl1_x4(__m128i v) noexcept
++{
++	return _mm_or_si128(_mm_slli_epi32(v, 1), _mm_srli_epi32(v, 31));
++}
++
++// Compute the next four schedule words.
++static inline __m128i sha1_schedule_sse2(
++		__m128i w0, __m128i w1, __m128i w2, __m128i w3) noexcept
++{
++	// W[-3] contribution: [W[i-3], W[i-2], W[i-1], 0]
++	// (_mm_srli_si128 shifts the 128-bit register toward lower addresses by n bytes,
++	//  moving data from higher lanes to lower lanes and zeroing the vacated high lanes)
++	__m128i ws = _mm_srli_si128(w3, 4);
++
++	// W[-14] contribution: [W[i-14], W[i-13], W[i-12], W[i-11]]
++	//   = upper half of w0  ||  lower half of w1
++	__m128i wm14 = _mm_or_si128(
++			_mm_srli_si128(w0, 8),   // [W[i-14], W[i-13], 0,        0       ]
++			_mm_slli_si128(w1, 8));  // [0,        0,        W[i-12], W[i-11] ]
++
++	// XOR all four terms: W[-3]partial ^ W[-8] ^ W[-14] ^ W[-16]
++	__m128i tmp = _mm_xor_si128(
++			_mm_xor_si128(ws,   w2),
++			_mm_xor_si128(wm14, w0));
++
++	// ROTL1 → [W[i], W[i+1], W[i+2], PARTIAL_W[i+3]]
++	// PARTIAL_W[i+3] = rol(W[i-5]^W[i-11]^W[i-13], 1)  ← missing the W[i] term.
++	__m128i result = sha1_rotl1_x4(tmp);
++
++	// Fix lane 3: W[i+3] = rol(W[i] ^ ..., 1)
++	//                     = rol(W[i], 1) ^ rol(..., 1)
++	//                     = rol(W[i], 1) ^ PARTIAL_W[i+3]
++	// W[i] sits in lane 0; shift it to lane 3 (zeroing other lanes) then ROTL1.
++	result = _mm_xor_si128(result,
++			sha1_rotl1_x4(_mm_slli_si128(result, 12)));  // [0,0,0, rol(W[i],1)]
++
++	return result;
++}
++
++// ---------------------------------------------------------------------------
++// SHA-1 block compression with SSE2-accelerated message schedule.
++//
++// IMPORTANT – state storage convention in MAME:
++//   st[0]=H4, st[1]=H3, st[2]=H2, st[3]=H1, st[4]=H0   (reversed)
++//
++// So the correct mapping to the explicit SHA-1 working variables is:
++//   a = st[4] (H0),  b = st[3] (H1),  c = st[2] (H2),
++//   d = st[1] (H3),  e = st[0] (H4)
++//
++// And the final accumulation is:
++//   st[4] += a,  st[3] += b,  st[2] += c,  st[1] += d,  st[0] += e
++//
++// data[] arrives already in host-endian; MAME's append() performs the
++// byte-swap when filling m_buf on little-endian platforms (XOR-3 swizzle).
++// ---------------------------------------------------------------------------
++
++inline void sha1_process_sse2(std::array<uint32_t, 5> &st, uint32_t *data) noexcept
++{
++	// ----- Phase 1: precompute W[i]+K[i] for all 80 rounds via SSE2 -----
++
++	alignas(16) uint32_t WK[80]; // W[i] + K[i], one entry per round
++
++	const __m128i K1 = _mm_set1_epi32(0x5a827999U); // rounds  0-19
++	const __m128i K2 = _mm_set1_epi32(0x6ed9eba1U); // rounds 20-39
++	const __m128i K3 = _mm_set1_epi32(0x8f1bbcdcU); // rounds 40-59
++	const __m128i K4 = _mm_set1_epi32(0xca62c1d6U); // rounds 60-79
++
++	// Load the 16 message words from the block buffer.
++	__m128i w0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data +  0));
++	__m128i w1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data +  4));
++	__m128i w2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data +  8));
++	__m128i w3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 12));
++
++	// Rounds 0-19  (K1; last 4 come from the first schedule call)
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK +  0), _mm_add_epi32(w0, K1));
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK +  4), _mm_add_epi32(w1, K1));
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK +  8), _mm_add_epi32(w2, K1));
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 12), _mm_add_epi32(w3, K1));
++	__m128i w4  = sha1_schedule_sse2(w0, w1, w2, w3);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 16), _mm_add_epi32(w4,  K1));
++
++	// Rounds 20-39  (K2)
++	__m128i w5  = sha1_schedule_sse2(w1, w2, w3, w4);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 20), _mm_add_epi32(w5,  K2));
++	__m128i w6  = sha1_schedule_sse2(w2, w3, w4, w5);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 24), _mm_add_epi32(w6,  K2));
++	__m128i w7  = sha1_schedule_sse2(w3, w4, w5, w6);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 28), _mm_add_epi32(w7,  K2));
++	__m128i w8  = sha1_schedule_sse2(w4, w5, w6, w7);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 32), _mm_add_epi32(w8,  K2));
++	__m128i w9  = sha1_schedule_sse2(w5, w6, w7, w8);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 36), _mm_add_epi32(w9,  K2));
++
++	// Rounds 40-59  (K3)
++	__m128i w10 = sha1_schedule_sse2(w6,  w7,  w8,  w9);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 40), _mm_add_epi32(w10, K3));
++	__m128i w11 = sha1_schedule_sse2(w7,  w8,  w9,  w10);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 44), _mm_add_epi32(w11, K3));
++	__m128i w12 = sha1_schedule_sse2(w8,  w9,  w10, w11);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 48), _mm_add_epi32(w12, K3));
++	__m128i w13 = sha1_schedule_sse2(w9,  w10, w11, w12);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 52), _mm_add_epi32(w13, K3));
++	__m128i w14 = sha1_schedule_sse2(w10, w11, w12, w13);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 56), _mm_add_epi32(w14, K3));
++
++	// Rounds 60-79  (K4)
++	__m128i w15 = sha1_schedule_sse2(w11, w12, w13, w14);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 60), _mm_add_epi32(w15, K4));
++	__m128i w16 = sha1_schedule_sse2(w12, w13, w14, w15);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 64), _mm_add_epi32(w16, K4));
++	__m128i w17 = sha1_schedule_sse2(w13, w14, w15, w16);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 68), _mm_add_epi32(w17, K4));
++	__m128i w18 = sha1_schedule_sse2(w14, w15, w16, w17);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 72), _mm_add_epi32(w18, K4));
++	__m128i w19 = sha1_schedule_sse2(w15, w16, w17, w18);
++	_mm_store_si128(reinterpret_cast<__m128i *>(WK + 76), _mm_add_epi32(w19, K4));
++
++	// ----- Phase 2: 80 scalar rounds using precomputed WK[] -----
++	//
++	// Correct initialisation – state is stored reversed in MAME:
++	//   a = st[4] = H0,  b = st[3] = H1,  c = st[2] = H2,
++	//   d = st[1] = H3,  e = st[0] = H4
++	uint32_t a = st[4], b = st[3], c = st[2], d = st[1], e = st[0];
++
++	// Round step macros (pure scalar – compiler generates optimal code).
++	// F0 = d ^ (b & (c ^ d))          Choice      rounds  0-19
++	// F1 = b ^ c ^ d                  Parity      rounds 20-39
++	// F2 = (b & c) | (d & (b | c))    Majority    rounds 40-59
++	// F3 = b ^ c ^ d                  Parity      rounds 60-79
++#define SHA1_F0(a,b,c,d,e,wk) do { \
++	uint32_t _t = ((a)<<5|(a)>>27) + ((d)^((b)&((c)^(d)))) + (e) + (wk); \
++	(e)=(d); (d)=(c); (c)=((b)<<30|(b)>>2); (b)=(a); (a)=_t; } while(0)
++#define SHA1_F1(a,b,c,d,e,wk) do { \
++	uint32_t _t = ((a)<<5|(a)>>27) + ((b)^(c)^(d))         + (e) + (wk); \
++	(e)=(d); (d)=(c); (c)=((b)<<30|(b)>>2); (b)=(a); (a)=_t; } while(0)
++#define SHA1_F2(a,b,c,d,e,wk) do { \
++	uint32_t _t = ((a)<<5|(a)>>27) + (((b)&(c))|((d)&((b)|(c)))) + (e) + (wk); \
++	(e)=(d); (d)=(c); (c)=((b)<<30|(b)>>2); (b)=(a); (a)=_t; } while(0)
++
++	// Rounds 0-19  (Choice)
++	SHA1_F0(a,b,c,d,e,WK[ 0]); SHA1_F0(a,b,c,d,e,WK[ 1]); SHA1_F0(a,b,c,d,e,WK[ 2]); SHA1_F0(a,b,c,d,e,WK[ 3]);
++	SHA1_F0(a,b,c,d,e,WK[ 4]); SHA1_F0(a,b,c,d,e,WK[ 5]); SHA1_F0(a,b,c,d,e,WK[ 6]); SHA1_F0(a,b,c,d,e,WK[ 7]);
++	SHA1_F0(a,b,c,d,e,WK[ 8]); SHA1_F0(a,b,c,d,e,WK[ 9]); SHA1_F0(a,b,c,d,e,WK[10]); SHA1_F0(a,b,c,d,e,WK[11]);
++	SHA1_F0(a,b,c,d,e,WK[12]); SHA1_F0(a,b,c,d,e,WK[13]); SHA1_F0(a,b,c,d,e,WK[14]); SHA1_F0(a,b,c,d,e,WK[15]);
++	SHA1_F0(a,b,c,d,e,WK[16]); SHA1_F0(a,b,c,d,e,WK[17]); SHA1_F0(a,b,c,d,e,WK[18]); SHA1_F0(a,b,c,d,e,WK[19]);
++
++	// Rounds 20-39  (Parity)
++	SHA1_F1(a,b,c,d,e,WK[20]); SHA1_F1(a,b,c,d,e,WK[21]); SHA1_F1(a,b,c,d,e,WK[22]); SHA1_F1(a,b,c,d,e,WK[23]);
++	SHA1_F1(a,b,c,d,e,WK[24]); SHA1_F1(a,b,c,d,e,WK[25]); SHA1_F1(a,b,c,d,e,WK[26]); SHA1_F1(a,b,c,d,e,WK[27]);
++	SHA1_F1(a,b,c,d,e,WK[28]); SHA1_F1(a,b,c,d,e,WK[29]); SHA1_F1(a,b,c,d,e,WK[30]); SHA1_F1(a,b,c,d,e,WK[31]);
++	SHA1_F1(a,b,c,d,e,WK[32]); SHA1_F1(a,b,c,d,e,WK[33]); SHA1_F1(a,b,c,d,e,WK[34]); SHA1_F1(a,b,c,d,e,WK[35]);
++	SHA1_F1(a,b,c,d,e,WK[36]); SHA1_F1(a,b,c,d,e,WK[37]); SHA1_F1(a,b,c,d,e,WK[38]); SHA1_F1(a,b,c,d,e,WK[39]);
++
++	// Rounds 40-59  (Majority)
++	SHA1_F2(a,b,c,d,e,WK[40]); SHA1_F2(a,b,c,d,e,WK[41]); SHA1_F2(a,b,c,d,e,WK[42]); SHA1_F2(a,b,c,d,e,WK[43]);
++	SHA1_F2(a,b,c,d,e,WK[44]); SHA1_F2(a,b,c,d,e,WK[45]); SHA1_F2(a,b,c,d,e,WK[46]); SHA1_F2(a,b,c,d,e,WK[47]);
++	SHA1_F2(a,b,c,d,e,WK[48]); SHA1_F2(a,b,c,d,e,WK[49]); SHA1_F2(a,b,c,d,e,WK[50]); SHA1_F2(a,b,c,d,e,WK[51]);
++	SHA1_F2(a,b,c,d,e,WK[52]); SHA1_F2(a,b,c,d,e,WK[53]); SHA1_F2(a,b,c,d,e,WK[54]); SHA1_F2(a,b,c,d,e,WK[55]);
++	SHA1_F2(a,b,c,d,e,WK[56]); SHA1_F2(a,b,c,d,e,WK[57]); SHA1_F2(a,b,c,d,e,WK[58]); SHA1_F2(a,b,c,d,e,WK[59]);
++
++	// Rounds 60-79  (Parity, same function as rounds 20-39)
++	SHA1_F1(a,b,c,d,e,WK[60]); SHA1_F1(a,b,c,d,e,WK[61]); SHA1_F1(a,b,c,d,e,WK[62]); SHA1_F1(a,b,c,d,e,WK[63]);
++	SHA1_F1(a,b,c,d,e,WK[64]); SHA1_F1(a,b,c,d,e,WK[65]); SHA1_F1(a,b,c,d,e,WK[66]); SHA1_F1(a,b,c,d,e,WK[67]);
++	SHA1_F1(a,b,c,d,e,WK[68]); SHA1_F1(a,b,c,d,e,WK[69]); SHA1_F1(a,b,c,d,e,WK[70]); SHA1_F1(a,b,c,d,e,WK[71]);
++	SHA1_F1(a,b,c,d,e,WK[72]); SHA1_F1(a,b,c,d,e,WK[73]); SHA1_F1(a,b,c,d,e,WK[74]); SHA1_F1(a,b,c,d,e,WK[75]);
++	SHA1_F1(a,b,c,d,e,WK[76]); SHA1_F1(a,b,c,d,e,WK[77]); SHA1_F1(a,b,c,d,e,WK[78]); SHA1_F1(a,b,c,d,e,WK[79]);
++
++#undef SHA1_F0
++#undef SHA1_F1
++#undef SHA1_F2
++
++	// Accumulate back into the reversed state storage.
++	// (After N=80 rounds of the explicit SHA-1 step, the rotating-array
++	//  equivalence gives: a↔d[4], b↔d[3], c↔d[2], d↔d[1], e↔d[0].)
++	st[4] += a; st[3] += b; st[2] += c; st[1] += d; st[0] += e;
++}
++#endif // SSE2
++
++#if UTIL_SHA1_HAS_SHA_NI
++// SHA-1 block compression using Intel SHA extensions.
++// data[] already contains big-endian words (byte-swapped when LSB_FIRST).
++static inline void sha1_process_shani(std::array<uint32_t, 5> &st, uint32_t *data) noexcept
++{
++	__m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;
++	__m128i MSG0, MSG1, MSG2, MSG3;
++
++	// MAME state order: st[4]=H0 ... st[0]=H4
++	ABCD = _mm_set_epi32(st[4], st[3], st[2], st[1]); // A,B,C,D in lanes 3..0
++	E0 = _mm_set_epi32(st[0], 0, 0, 0);               // E in lane 3
++
++	ABCD_SAVE = ABCD;
++	E0_SAVE = E0;
++
++	// Rounds 0-3
++	MSG0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 0));
++	MSG0 = _mm_shuffle_epi32(MSG0, 0x1B); // SHA-NI attend W[0] en bits [127:96]
++	E0 = _mm_add_epi32(E0, MSG0);
++	E1 = ABCD;
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
++
++	// Rounds 4-7
++	MSG1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 4));
++	MSG1 = _mm_shuffle_epi32(MSG1, 0x1B);
++	E1 = _mm_sha1nexte_epu32(E1, MSG1);
++	E0 = ABCD;
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
++	MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
++
++	// Rounds 8-11
++	MSG2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 8));
++	MSG2 = _mm_shuffle_epi32(MSG2, 0x1B);
++	E0 = _mm_sha1nexte_epu32(E0, MSG2);
++	E1 = ABCD;
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
++	MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
++	MSG0 = _mm_xor_si128(MSG0, MSG2);
++
++	// Rounds 12-15
++	MSG3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + 12));
++	MSG3 = _mm_shuffle_epi32(MSG3, 0x1B);
++	E1 = _mm_sha1nexte_epu32(E1, MSG3);
++	E0 = ABCD;
++	MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
++	MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
++	MSG1 = _mm_xor_si128(MSG1, MSG3);
++
++	// Rounds 16-19
++	E0 = _mm_sha1nexte_epu32(E0, MSG0);
++	E1 = ABCD;
++	MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
++	MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
++	MSG2 = _mm_xor_si128(MSG2, MSG0);
++
++	// Rounds 20-23
++	E1 = _mm_sha1nexte_epu32(E1, MSG1);
++	E0 = ABCD;
++	MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
++	MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
++	MSG3 = _mm_xor_si128(MSG3, MSG1);
++
++	// Rounds 24-27
++	E0 = _mm_sha1nexte_epu32(E0, MSG2);
++	E1 = ABCD;
++	MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
++	MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
++	MSG0 = _mm_xor_si128(MSG0, MSG2);
++
++	// Rounds 28-31
++	E1 = _mm_sha1nexte_epu32(E1, MSG3);
++	E0 = ABCD;
++	MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
++	MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
++	MSG1 = _mm_xor_si128(MSG1, MSG3);
++
++	// Rounds 32-35
++	E0 = _mm_sha1nexte_epu32(E0, MSG0);
++	E1 = ABCD;
++	MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
++	MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
++	MSG2 = _mm_xor_si128(MSG2, MSG0);
++
++	// Rounds 36-39
++	E1 = _mm_sha1nexte_epu32(E1, MSG1);
++	E0 = ABCD;
++	MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
++	MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
++	MSG3 = _mm_xor_si128(MSG3, MSG1);
++
++	// Rounds 40-43
++	E0 = _mm_sha1nexte_epu32(E0, MSG2);
++	E1 = ABCD;
++	MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
++	MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
++	MSG0 = _mm_xor_si128(MSG0, MSG2);
++
++	// Rounds 44-47
++	E1 = _mm_sha1nexte_epu32(E1, MSG3);
++	E0 = ABCD;
++	MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
++	MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
++	MSG1 = _mm_xor_si128(MSG1, MSG3);
++
++	// Rounds 48-51
++	E0 = _mm_sha1nexte_epu32(E0, MSG0);
++	E1 = ABCD;
++	MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
++	MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
++	MSG2 = _mm_xor_si128(MSG2, MSG0);
++
++	// Rounds 52-55
++	E1 = _mm_sha1nexte_epu32(E1, MSG1);
++	E0 = ABCD;
++	MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
++	MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
++	MSG3 = _mm_xor_si128(MSG3, MSG1);
++
++	// Rounds 56-59
++	E0 = _mm_sha1nexte_epu32(E0, MSG2);
++	E1 = ABCD;
++	MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
++	MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
++	MSG0 = _mm_xor_si128(MSG0, MSG2);
++
++	// Rounds 60-63
++	E1 = _mm_sha1nexte_epu32(E1, MSG3);
++	E0 = ABCD;
++	MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
++	MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
++	MSG1 = _mm_xor_si128(MSG1, MSG3);
++
++	// Rounds 64-67
++	E0 = _mm_sha1nexte_epu32(E0, MSG0);
++	E1 = ABCD;
++	MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
++	MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
++	MSG2 = _mm_xor_si128(MSG2, MSG0);
++
++	// Rounds 68-71
++	E1 = _mm_sha1nexte_epu32(E1, MSG1);
++	E0 = ABCD;
++	MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
++	MSG3 = _mm_xor_si128(MSG3, MSG1);
++
++	// Rounds 72-75
++	E0 = _mm_sha1nexte_epu32(E0, MSG2);
++	E1 = ABCD;
++	MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
++
++	// Rounds 76-79
++	E1 = _mm_sha1nexte_epu32(E1, MSG3);
++	E0 = ABCD;
++	ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
++
++	// Combine state
++	E0 = _mm_sha1nexte_epu32(E0, E0_SAVE);
++	ABCD = _mm_add_epi32(ABCD, ABCD_SAVE);
++
++#if defined(__SSE4_1__)
++	st[4] = static_cast<uint32_t>(_mm_extract_epi32(ABCD, 3));
++	st[3] = static_cast<uint32_t>(_mm_extract_epi32(ABCD, 2));
++	st[2] = static_cast<uint32_t>(_mm_extract_epi32(ABCD, 1));
++	st[1] = static_cast<uint32_t>(_mm_extract_epi32(ABCD, 0));
++	st[0] = static_cast<uint32_t>(_mm_extract_epi32(E0,   3));
++#else
++	alignas(16) uint32_t abcd[4];
++	alignas(16) uint32_t ebuf[4];
++	_mm_store_si128(reinterpret_cast<__m128i *>(abcd), ABCD);
++	_mm_store_si128(reinterpret_cast<__m128i *>(ebuf), E0);
++
++	st[4] = abcd[3];
++	st[3] = abcd[2];
++	st[2] = abcd[1];
++	st[1] = abcd[0];
++	st[0] = ebuf[3];
++#endif
++}
++#endif // UTIL_SHA1_HAS_SHA_NI
++
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++// Byte-swap a 64-byte block (16 words) using AVX2 (vpshufb).
++static inline void sha1_byteswap_block_avx2(const uint8_t *src, uint32_t *dst) noexcept
++{
++	const __m256i mask = _mm256_set_epi8(
++			12, 13, 14, 15,
++			8,  9, 10, 11,
++			4,  5,  6,  7,
++			0,  1,  2,  3,
++			12, 13, 14, 15,
++			8,  9, 10, 11,
++			4,  5,  6,  7,
++			0,  1,  2,  3);
++
++	__m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src +  0));
++	__m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + 32));
++
++	x0 = _mm256_shuffle_epi8(x0, mask);
++	x1 = _mm256_shuffle_epi8(x1, mask);
++
++	_mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 0), x0);
++	_mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 8), x1);
++}
++#endif // UTIL_SHA1_HAS_AVX2 && LSB_FIRST
++
++#if UTIL_SHA1_HAS_SSSE3 && defined(LSB_FIRST)
++// Byte-swap a 64-byte block (16 words) using SSSE3.
++static inline void sha1_byteswap_block_ssse3(const uint8_t *src, uint32_t *dst) noexcept
++{
++	const __m128i mask = _mm_set_epi8(
++			12, 13, 14, 15,
++			8,  9, 10, 11,
++			4,  5,  6,  7,
++			0,  1,  2,  3);
++
++	__m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src +  0));
++	__m128i x1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + 16));
++	__m128i x2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + 32));
++	__m128i x3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + 48));
++
++	x0 = _mm_shuffle_epi8(x0, mask);
++	x1 = _mm_shuffle_epi8(x1, mask);
++	x2 = _mm_shuffle_epi8(x2, mask);
++	x3 = _mm_shuffle_epi8(x3, mask);
++
++	_mm_storeu_si128(reinterpret_cast<__m128i *>(dst +  0), x0);
++	_mm_storeu_si128(reinterpret_cast<__m128i *>(dst +  4), x1);
++	_mm_storeu_si128(reinterpret_cast<__m128i *>(dst +  8), x2);
++	_mm_storeu_si128(reinterpret_cast<__m128i *>(dst + 12), x3);
++}
++#endif // UTIL_SHA1_HAS_SSSE3 && LSB_FIRST
++
++#if UTIL_SHA1_USE_SSE2 && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
++namespace {
++
++// ---------------------------------------------------------------------------
++// sha1_validate_sse2 – vérifie sha1_process_sse2 contre sha1_process_scalar
++// en utilisant l'état initial dans l'ORDRE MAME [H4,H3,H2,H1,H0], pas
++// l'ordre standard.  Sans cela la validation passe même si les indices
++// a/b/c/d/e sont échangés dans les deux fonctions de la même façon.
++//
++// Blocs de test : données déterministes couvrant les quatre plages de K.
++// ---------------------------------------------------------------------------
++
++// Etat initial SHA-1 dans l'ordre MAME : st[0]=H4 ... st[4]=H0
++constexpr std::array<uint32_t, 5> kSha1MameInitState = {{
++    0xc3d2e1f0U,   // st[0] = H4
++    0x10325476U,   // st[1] = H3
++    0x98badcfeU,   // st[2] = H2
++    0xefcdab89U,   // st[3] = H1
++    0x67452301U    // st[4] = H0
++}};
++
++// Quelques blocs variés pour exercer les 4 fonctions de compression
++constexpr std::array<std::array<uint32_t, 16>, 4> kSha1Sse2TestBlocks = {{
++    {{  // bloc de zéros  → force la branche la plus simple
++        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
++        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
++        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
++        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U
++    }},
++    {{  // compteur croissant → mots tous différents
++        0x00010203U, 0x04050607U, 0x08090a0bU, 0x0c0d0e0fU,
++        0x10111213U, 0x14151617U, 0x18191a1bU, 0x1c1d1e1fU,
++        0x20212223U, 0x24252627U, 0x28292a2bU, 0x2c2d2e2fU,
++        0x30313233U, 0x34353637U, 0x38393a3bU, 0x3c3d3e3fU
++    }},
++    {{  // tous à 0xFF → teste les retenues dans les additions
++        0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU,
++        0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU,
++        0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU,
++        0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU
++    }},
++    {{  // motif pseudo-aléatoire
++        0x89abcdefU, 0x01234567U, 0x76543210U, 0xfedcba98U,
++        0xcafebabeU, 0xdeadbeefU, 0x0badf00dU, 0xfeedfaceU,
++        0xa5a5a5a5U, 0x5a5a5a5aU, 0x33cc33ccU, 0xcc33cc33U,
++        0x13579bdfU, 0x2468ace0U, 0xbeefcafeU, 0xfacefeedU
++    }}
++}};
++
++bool sha1_validate_sse2() noexcept
++{
++	for (auto const &block : kSha1Sse2TestBlocks)
++	{
++		// Les deux états démarrent avec la convention MAME [H4,H3,H2,H1,H0]
++		std::array<uint32_t, 5> scalar_state = kSha1MameInitState;
++		std::array<uint32_t, 5> sse2_state   = kSha1MameInitState;
++
++		uint32_t scalar_data[16];
++		uint32_t sse2_data[16];
++		for (unsigned i = 0; i < 16; i++)
++		{
++			scalar_data[i] = block[i];
++			sse2_data[i]   = block[i];
++		}
++
++		sha1_process_scalar(scalar_state, scalar_data);
++		sha1_process_sse2  (sse2_state,   sse2_data);
++
++		if (scalar_state != sse2_state)
++			return false;
++	}
++	return true;
++}
++
++#if UTIL_SHA1_HAS_SHA_NI
++bool sha1_validate_shani() noexcept
++{
++	for (auto const &block : kSha1Sse2TestBlocks)
++	{
++		std::array<uint32_t, 5> scalar_state = kSha1MameInitState;
++		std::array<uint32_t, 5> shani_state  = kSha1MameInitState;
++
++		uint32_t scalar_data[16];
++		uint32_t shani_data[16];
++		for (unsigned i = 0; i < 16; i++)
++		{
++			scalar_data[i] = block[i];
++			shani_data[i]  = block[i];
++		}
++
++		sha1_process_scalar(scalar_state, scalar_data);
++		sha1_process_shani (shani_state,  shani_data);
++
++		if (scalar_state != shani_state)
++			return false;
++	}
++	return true;
++}
++#endif // UTIL_SHA1_HAS_SHA_NI
++
++} // anonymous namespace
++#endif // SSE2 validation
++
++using sha1_process_fn = void(*)(std::array<uint32_t, 5> &, uint32_t *);
++static std::atomic<sha1_process_fn> sha1_process_impl{ sha1_process_scalar };
++#if UTIL_SHA1_HAS_SHA_NI
++static bool sha1_has_sha_ni = false;
++#endif
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++static bool sha1_has_avx2 = false;
++#endif
++#if UTIL_SHA1_HAS_SSSE3 && defined(LSB_FIRST)
++static bool sha1_has_ssse3 = false;
++#endif
++
++static void sha1_init_cpu_caps() noexcept
++{
++#if UTIL_SHA1_USE_SSE2 && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
++	static std::once_flag once;
++	std::call_once(once, []() noexcept
++	{
++#if defined(_MSC_VER)
++		int cpuInfo[4] = { 0 };
++		__cpuid(cpuInfo, 1);
++		bool hasSse2 = (cpuInfo[3] & (1 << 26)) != 0;
++#if UTIL_SHA1_HAS_SSSE3 && defined(LSB_FIRST)
++		sha1_has_ssse3 = (cpuInfo[2] & (1 << 9)) != 0; // SSSE3
++#endif
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++		bool osAvx = false;
++		bool hasOsxsave = (cpuInfo[2] & (1 << 27)) != 0;
++		bool hasAvx = (cpuInfo[2] & (1 << 28)) != 0;
++		if (hasOsxsave && hasAvx)
++		{
++			unsigned long long xcr0 = _xgetbv(0);
++			osAvx = ((xcr0 & 0x6) == 0x6);
++		}
++#endif
++		int cpuInfo7[4] = { 0 };
++		__cpuidex(cpuInfo7, 7, 0);
++#if UTIL_SHA1_HAS_SHA_NI
++		sha1_has_sha_ni = (cpuInfo7[1] & (1 << 29)) != 0; // SHA
++#endif
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++		if (osAvx)
++			sha1_has_avx2 = (cpuInfo7[1] & (1 << 5)) != 0; // AVX2
++#endif
++		if (hasSse2 && sha1_validate_sse2())
++			sha1_process_impl.store(sha1_process_sse2, std::memory_order_relaxed);
++#if UTIL_SHA1_HAS_SHA_NI
++		if (sha1_has_sha_ni && sha1_validate_shani())
++			sha1_process_impl.store(sha1_process_shani, std::memory_order_relaxed);
++#endif
++#else
++		// Si on compile avec SSE2 sur un compilateur non-MSVC,
++		// on considère que le CPU supporte SSE2.
++		unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
++		bool hasLeaf1 = __get_cpuid(1, &eax, &ebx, &ecx, &edx);
++#if UTIL_SHA1_HAS_SSSE3 && defined(LSB_FIRST)
++		if (hasLeaf1)
++			sha1_has_ssse3 = (ecx & (1U << 9)) != 0; // SSSE3
++#endif
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++		bool osAvx = false;
++		if (hasLeaf1)
++		{
++			bool hasOsxsave = (ecx & (1U << 27)) != 0;
++			bool hasAvx = (ecx & (1U << 28)) != 0;
++			if (hasOsxsave && hasAvx)
++			{
++				uint64_t xcr0 = _xgetbv(0);
++				osAvx = ((xcr0 & 0x6) == 0x6);
++			}
++		}
++#endif
++		bool hasLeaf7 = __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
++#if UTIL_SHA1_HAS_SHA_NI
++		if (hasLeaf7)
++			sha1_has_sha_ni = (ebx & (1U << 29)) != 0; // SHA
++#endif
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++		if (osAvx && hasLeaf7)
++			sha1_has_avx2 = (ebx & (1U << 5)) != 0; // AVX2
++#endif
++		bool hasSse2 = hasLeaf1 && ((edx & (1U << 26)) != 0);
++		if (hasSse2 && sha1_validate_sse2())
++			sha1_process_impl.store(sha1_process_sse2, std::memory_order_relaxed);
++#if UTIL_SHA1_HAS_SHA_NI
++		if (sha1_has_sha_ni && sha1_validate_shani())
++			sha1_process_impl.store(sha1_process_shani, std::memory_order_relaxed);
++#endif
++#endif
++	});
++#endif
++}
+ } // anonymous namespace
+ 
+ 
+@@ -173,6 +854,8 @@
+ 
+ void sha1_creator::reset() noexcept
+ {
++	sha1_init_cpu_caps();
++
+ 	m_cnt = 0U;
+ 	m_st[0] = 0xc3d2e1f0U;
+ 	m_st[1] = 0x10325476U;
+@@ -193,6 +876,7 @@
+ #else
+ 	constexpr unsigned swizzle = 0U;
+ #endif
++	auto const process = sha1_process_impl.load(std::memory_order_relaxed);
+ 	uint32_t residual = (uint32_t(m_cnt) >> 3) & 63U;
+ 	m_cnt += uint64_t(length) << 3;
+ 	uint32_t offset = 0U;
+@@ -202,13 +886,43 @@
+ 		{
+ 			for (offset = 0U; (offset + residual) < 64U; offset++)
+ 				reinterpret_cast<uint8_t *>(m_buf)[(offset + residual) ^ swizzle] = reinterpret_cast<const uint8_t *>(data)[offset];
+-			sha1_process(m_st, m_buf);
++			process(m_st, m_buf);
++		}
++#if UTIL_SHA1_HAS_AVX2 && defined(LSB_FIRST)
++		if (sha1_has_avx2)
++		{
++			const uint8_t *src8 = reinterpret_cast<const uint8_t *>(data) + offset;
++			while ((length - offset) >= 64U)
++			{
++				sha1_byteswap_block_avx2(src8, m_buf);
++				process(m_st, m_buf);
++				src8 += 64U;
++				offset += 64U;
++			}
++		}
++		else
++#endif
++#if UTIL_SHA1_HAS_SSSE3 && defined(LSB_FIRST)
++		if (sha1_has_ssse3)
++		{
++			const uint8_t *src8 = reinterpret_cast<const uint8_t *>(data) + offset;
++			while ((length - offset) >= 64U)
++			{
++				sha1_byteswap_block_ssse3(src8, m_buf);
++				process(m_st, m_buf);
++				src8 += 64U;
++				offset += 64U;
++			}
+ 		}
+-		while ((length - offset) >= 64U)
++		else
++#endif
+ 		{
+-			for (residual = 0U; residual < 64U; residual++, offset++)
+-				reinterpret_cast<uint8_t *>(m_buf)[residual ^ swizzle] = reinterpret_cast<const uint8_t *>(data)[offset];
+-			sha1_process(m_st, m_buf);
++			while ((length - offset) >= 64U)
++			{
++				for (residual = 0U; residual < 64U; residual++, offset++)
++					reinterpret_cast<uint8_t *>(m_buf)[residual ^ swizzle] = reinterpret_cast<const uint8_t *>(data)[offset];
++				process(m_st, m_buf);
++			}
+ 		}
+ 		residual = 0U;
+ 	}
+@@ -301,13 +1015,12 @@
+ bool crc32_t::from_string(std::string_view string) noexcept
+ {
+ 	// must be at least long enough to hold everything
+-	m_raw = 0;
+ 	if (string.length() < (2 * sizeof(m_raw)))
+ 		return false;
+ 
+ 	// iterate through our raw buffer
+ 	m_raw = 0;
+-	for (int bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
++	for (size_t bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
+ 	{
+ 		int const nibble = char_to_hex(string[0]);
+ 		if (nibble == -1)
+@@ -352,13 +1065,12 @@
+ bool crc16_t::from_string(std::string_view string) noexcept
+ {
+ 	// must be at least long enough to hold everything
+-	m_raw = 0;
+ 	if (string.length() < (2 * sizeof(m_raw)))
+ 		return false;
+ 
+ 	// iterate through our raw buffer
+ 	m_raw = 0;
+-	for (int bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
++	for (size_t bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
+ 	{
+ 		int const nibble = char_to_hex(string[0]);
+ 		if (nibble == -1)
+@@ -433,12 +1145,55 @@
+ 		0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
+ 	};
+ 
+-	const auto *src = reinterpret_cast<const uint8_t *>(data);
++	static uint16_t s_slice[16][256];
++	static uint16_t s_slicehi[256];
++	static uint16_t s_slicelo[256];
++	static uint16_t s_slice16hi[256];
++	static uint16_t s_slice16lo[256];
++	static std::once_flag s_init;
++	std::call_once(s_init, []() {
++		auto tc = [](uint16_t v) -> uint16_t {
++			return (uint16_t)((v << 8) ^ s_table[v >> 8]);
++		};
++		for (int b = 0; b < 256; b++) {
++			s_slice[0][b] = s_table[b];
++			for (int i = 1; i < 16; i++)
++				s_slice[i][b] = tc(s_slice[i - 1][b]);
++		}
++		for (int i = 0; i < 256; i++) {
++			uint16_t vh = (uint16_t)(i << 8), vl = (uint16_t)i;
++			for (int j = 0; j < 8; j++) { vh = tc(vh); vl = tc(vl); }
++			s_slicehi[i] = vh;
++			s_slicelo[i] = vl;
++			uint16_t vh16 = vh, vl16 = vl;
++			for (int j = 0; j < 8; j++) { vh16 = tc(vh16); vl16 = tc(vl16); }
++			s_slice16hi[i] = vh16;
++			s_slice16lo[i] = vl16;
++		}
++	});
+ 
+-	// fetch the current value into a local and rip through the source data
++	const auto *src = reinterpret_cast<const uint8_t *>(data);
+ 	uint16_t crc = m_accum.m_raw;
+-	while (length-- != 0)
+-		crc = (crc << 8) ^ s_table[(crc >> 8) ^ *src++];
++
++	while (length >= 16) {
++		crc = (uint16_t)(s_slice16hi[crc >> 8] ^ s_slice16lo[crc & 0xFF]
++			^ s_slice[15][src[0]] ^ s_slice[14][src[1]] ^ s_slice[13][src[2]] ^ s_slice[12][src[3]]
++			^ s_slice[11][src[4]] ^ s_slice[10][src[5]] ^ s_slice[9][src[6]]  ^ s_slice[8][src[7]]
++			^ s_slice[7][src[8]]  ^ s_slice[6][src[9]]  ^ s_slice[5][src[10]] ^ s_slice[4][src[11]]
++			^ s_slice[3][src[12]] ^ s_slice[2][src[13]] ^ s_slice[1][src[14]] ^ s_slice[0][src[15]]);
++		src += 16;
++		length -= 16;
++	}
++	while (length >= 8) {
++		crc = (uint16_t)(s_slicehi[crc >> 8] ^ s_slicelo[crc & 0xFF]
++			^ s_slice[7][src[0]] ^ s_slice[6][src[1]] ^ s_slice[5][src[2]] ^ s_slice[4][src[3]]
++			^ s_slice[3][src[4]] ^ s_slice[2][src[5]] ^ s_slice[1][src[6]] ^ s_slice[0][src[7]]);
++		src += 8;
++		length -= 8;
++	}
++	while (length--)
++		crc = (uint16_t)((crc << 8) ^ s_table[(crc >> 8) ^ *src++]);
++
+ 	m_accum.m_raw = crc;
+ }
+ 
+@@ -455,13 +1210,12 @@
+ bool sum16_t::from_string(std::string_view string) noexcept
+ {
+ 	// must be at least long enough to hold everything
+-	m_raw = 0;
+ 	if (string.length() < (2 * sizeof(m_raw)))
+ 		return false;
+ 
+ 	// iterate through our raw buffer
+ 	m_raw = 0;
+-	for (int bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
++	for (size_t bytenum = 0; bytenum < sizeof(m_raw) * 2; bytenum++)
+ 	{
+ 		int const nibble = char_to_hex(string[0]);
+ 		if (nibble == -1)

@@ -1,0 +1,403 @@
+--- mame-mame0286/src/tools/chdman.cpp	2026-02-25 07:49:26.000000000 +0100
++++ chdman_build/src/tools/chdman.cpp	2026-03-15 14:17:28.488458600 +0100
+@@ -18,6 +18,7 @@
+ #include "md5.h"
+ #include "multibyte.h"
+ #include "osdcore.h"
++#include "osdsync.h"
+ #include "path.h"
+ #include "strformat.h"
+ #include "vbiparse.h"
+@@ -39,7 +40,10 @@
+ #include <tuple>
+ #include <unordered_map>
+ #include <utility>
++#include <atomic>
++#include <mutex>
+ #include <vector>
++#include <cpuid.h>
+ 
+ using util::string_format;
+ 
+@@ -1774,6 +1778,36 @@
+ 
+ 
+ //-------------------------------------------------
++//  do_verify - work queue callback (one per hunk)
++//-------------------------------------------------
++
++// Global hot-cache SHA1 state — single cursor across ALL batches.
++// Indexed by absolute hunk number: no cross-batch ordering bug possible.
++// Workers try to drain SHA1 immediately after decompression (data hot in L1/L2).
++// Main thread drains remainder after each batch (cold fallback, near-zero cost).
++
++struct verify_hunk_ctx
++{
++	chd_file**           chds;       // indexed by threadid
++	uint32_t             hunknum;    // premier hunk de cet item
++	uint32_t             count;      // nombre de hunks à traiter
++	uint8_t*             buffer;     // flat : count * hunk_bytes octets
++	uint32_t             hunk_bytes;
++	std::error_condition err;
++};
++
++static void* verify_hunk_cb(void* param, int threadid)
++{
++	auto* ctx = static_cast<verify_hunk_ctx*>(param);
++	for (uint32_t i = 0; i < ctx->count; i++)
++	{
++		ctx->err = ctx->chds[threadid]->read_hunk(ctx->hunknum + i, ctx->buffer + i * ctx->hunk_bytes);
++		if (ctx->err) break;
++	}
++	return nullptr;
++}
++
++//-------------------------------------------------
+ //  do_verify - validate the SHA-1 on a CHD
+ //-------------------------------------------------
+ 
+@@ -1805,25 +1839,125 @@
+ 	if (raw_sha1 == util::sha1_t::null)
+ 		report_error(0, "No verification to be done; CHD has no checksum");
+ 
+-	// create an array to read into
+-	std::vector<uint8_t> buffer((TEMP_BUFFER_SIZE / input_chd.hunk_bytes()) * input_chd.hunk_bytes());
++	// parallel verify using persistent OSD work queue (threads created once)
++	const uint32_t hunk_bytes    = input_chd.hunk_bytes();
++	const uint32_t hunk_count    = input_chd.hunk_count();
++	const uint64_t logical_bytes = input_chd.logical_bytes();
++
++	// one chd_file per possible threadid (WORK_MAX_THREADS = 16, only used ones pay LZMA cost)
++	std::vector<std::unique_ptr<chd_file>> wchds(WORK_MAX_THREADS);
++	std::vector<chd_file*> wchd_ptrs(WORK_MAX_THREADS, nullptr);
++	for (int i = 0; i < WORK_MAX_THREADS; i++)
++	{
++		util::core_file::ptr wfile;
++		std::error_condition werr = util::core_file::open(*input_chd_str->second, OPEN_FLAG_READ, wfile);
++		wchds[i] = std::make_unique<chd_file>();
++		if (!werr)
++			werr = wchds[i]->open(std::move(wfile), false, input_parent_chd.opened() ? &input_parent_chd : nullptr);
++		if (werr)
++			report_error(1, "Error opening worker CHD (%s): %s", *input_chd_str->second, werr.message());
++		wchd_ptrs[i] = wchds[i].get();
++	}
++	chd_file** chd_arr = wchd_ptrs.data();
++
++	// work queue: threads created once, reused across all batches
++	osd_work_queue* wq = osd_work_queue_alloc(WORK_QUEUE_FLAG_MULTI);
++
++	// triple-buffer pipeline: queue batches N+1 and N+2 before consuming N
++	// → SHA1 of N overlaps with decompression of N+1 and N+2
++	// HUNKS_PER_ITEM=16 : chaque work item traite 16 hunks consécutifs
++	// → amortit le mutex de la work queue (critique quand avhu est rapide en L3)
++	const uint32_t BATCH          = 1024u;
++	const uint32_t HUNKS_PER_ITEM = 16u;
++	const uint32_t ITEMS          = BATCH / HUNKS_PER_ITEM; // 64 items/batch
++	struct batch_set {
++		std::vector<verify_hunk_ctx> ctxs;
++		std::vector<uint8_t>         flatbuf; // BATCH * hunk_bytes, contigu
++		std::vector<osd_work_item*>  items;
++		uint32_t                     base_hunk = 0;
++		uint32_t                     hunk_cnt  = 0;
++		uint32_t                     item_cnt  = 0;
++	};
++	static constexpr int N_SLOTS = 3;
++
++	batch_set sets[N_SLOTS];
++	for (auto& s : sets)
++	{
++		s.ctxs.resize(ITEMS);
++		s.flatbuf.resize((size_t)BATCH * hunk_bytes);
++		s.items.resize(ITEMS, nullptr);
++		for (uint32_t i = 0; i < ITEMS; i++)
++		{
++			s.ctxs[i].chds       = chd_arr;
++			s.ctxs[i].hunk_bytes = hunk_bytes;
++			s.ctxs[i].buffer     = s.flatbuf.data() + (size_t)i * HUNKS_PER_ITEM * hunk_bytes;
++		}
++	}
+ 
+-	// read all the data and build up an SHA-1
+ 	util::sha1_creator rawsha1;
+-	for (uint64_t offset = 0; offset < input_chd.logical_bytes(); )
+-	{
+-		progress(false, "Verifying, %.1f%% complete... \r", 100.0 * double(offset) / double(input_chd.logical_bytes()));
+ 
+-		// determine how much to read
+-		uint32_t bytes_to_read = (std::min<uint64_t>)(buffer.size(), input_chd.logical_bytes() - offset);
+-		std::error_condition err = input_chd.read_bytes(offset, &buffer[0], bytes_to_read);
+-		if (err)
+-			report_error(1, "Error reading CHD file (%s): %s", *input_chd_str->second, err.message());
++	// queue_batch : remplit un slot avec item_cnt items de HUNKS_PER_ITEM hunks chacun
++	auto queue_batch = [&](batch_set& s, uint32_t base_hunk) {
++		s.base_hunk = base_hunk;
++		s.hunk_cnt  = std::min(BATCH, hunk_count - base_hunk);
++		s.item_cnt  = (s.hunk_cnt + HUNKS_PER_ITEM - 1) / HUNKS_PER_ITEM;
++		for (uint32_t i = 0; i < s.item_cnt; i++)
++		{
++			uint32_t h0          = base_hunk + i * HUNKS_PER_ITEM;
++			s.ctxs[i].hunknum   = h0;
++			s.ctxs[i].count     = std::min(HUNKS_PER_ITEM, hunk_count - h0);
++			s.ctxs[i].err       = std::error_condition();
++			s.items[i] = osd_work_item_queue(wq, verify_hunk_cb, &s.ctxs[i], 0);
++		}
++	};
++
++	// consume_batch : attend les items et calcule SHA1 hunk par hunk (en ordre)
++	auto consume_batch = [&](batch_set& s) {
++		for (uint32_t i = 0; i < s.item_cnt; i++)
++		{
++			osd_work_item_wait(s.items[i], OSD_EVENT_WAIT_INFINITE);
++			osd_work_item_release(s.items[i]);
++			s.items[i] = nullptr;
++			if (s.ctxs[i].err)
++			{
++				osd_work_queue_free(wq);
++				report_error(1, "Error reading CHD file (%s): %s", *input_chd_str->second, s.ctxs[i].err.message());
++			}
++			for (uint32_t j = 0; j < s.ctxs[i].count; j++)
++			{
++				const uint64_t hstart = (uint64_t)(s.ctxs[i].hunknum + j) * hunk_bytes;
++				const uint32_t valid  = (uint32_t)std::min((uint64_t)hunk_bytes, logical_bytes - hstart);
++				rawsha1.append(s.ctxs[i].buffer + j * hunk_bytes, valid);
++			}
++		}
++	};
++
++	// seed pipeline : remplir N_SLOTS-1 slots avant d'entrer dans la boucle
++	int cur = 0;
++	uint32_t base = 0;
++	for (int s = 0; s < N_SLOTS - 1 && base < hunk_count; s++)
++	{
++		queue_batch(sets[s], base);
++		base += sets[s].hunk_cnt;
++	}
+ 
+-		// add to the checksum
+-		rawsha1.append(&buffer[0], bytes_to_read);
+-		offset += bytes_to_read;
++	while (base < hunk_count)
++	{
++		progress(false, "Verifying, %.1f%% complete... \r", 100.0 * double(base) / double(hunk_count));
++		int nxt = (cur + N_SLOTS - 1) % N_SLOTS;
++		queue_batch(sets[nxt], base);
++		base += sets[nxt].hunk_cnt;
++		consume_batch(sets[cur]);
++		cur = (cur + 1) % N_SLOTS;
++	}
++	// drain N_SLOTS-1 slots restants
++	for (int i = 0; i < N_SLOTS - 1; i++)
++	{
++		consume_batch(sets[cur]);
++		cur = (cur + 1) % N_SLOTS;
+ 	}
++
++	osd_work_queue_free(wq);
+ 	util::sha1_t computed_sha1 = rawsha1.finish();
+ 
+ 	// finish up
+@@ -3395,13 +3516,14 @@
+ 
+ static void do_list_templates(parameters_map &params)
+ {
++	(void)params;
+ 	util::stream_format(std::cout, "\n");
+ 	util::stream_format(std::cout, "ID  Manufacturer  Model           Cylinders  Heads  Sectors  Sector Size  Total Size\n");
+ 	util::stream_format(std::cout, "------------------------------------------------------------------------------------\n");
+ 
+-	for (int id = 0; id < std::size(s_hd_templates); id++)
++	for (std::size_t id = 0; id < std::size(s_hd_templates); id++)
+ 	{
+-		util::stream_format(std::cout, "%2d  %-13s %-15s %9d  %5d  %7d  %11d  %7d MB\n",
++		util::stream_format(std::cout, "%2zu  %-13s %-15s %9d  %5d  %7d  %11d  %7d MB\n",
+ 			id,
+ 			s_hd_templates[id].manufacturer,
+ 			s_hd_templates[id].model,
+@@ -3416,6 +3538,72 @@
+ 
+ 
+ //-------------------------------------------------
++//  simd_active_string - returns the SIMD code paths that will be active on
++//  the current CPU, mirroring the runtime dispatch logic of hashing.cpp
++//  (SHA1), zlib-ng (inflate) and FLAC.
++//-------------------------------------------------
++
++static std::string simd_active_string()
++{
++	unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
++
++	bool have_sse2  = false;
++	bool have_ssse3 = false;
++	bool have_sse42 = false;
++	bool have_avx2  = false;
++	bool have_fma   = false;
++	bool have_shani = false;
++
++	bool osavx = false;
++	if (__get_cpuid(1, &eax, &ebx, &ecx, &edx))
++	{
++		have_sse2  = (edx & (1U << 26)) != 0;
++		have_ssse3 = (ecx & (1U <<  9)) != 0;
++		have_sse42 = (ecx & (1U << 20)) != 0;
++		have_fma   = (ecx & (1U << 12)) != 0;
++
++		bool osxsave = (ecx & (1U << 27)) != 0;
++		bool cpuid_avx = (ecx & (1U << 28)) != 0;
++		if (osxsave && cpuid_avx)
++		{
++			// xgetbv via inline asm — avoids -mxsave requirement
++			uint32_t xcr0_lo = 0, xcr0_hi = 0;
++			__asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0U));
++			osavx = (xcr0_lo & 0x6U) == 0x6U;
++		}
++	}
++	// Leaf 7: SHA-NI independent of AVX, AVX2 requires OS YMM support
++	if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
++	{
++		have_shani = (ebx & (1U << 29)) != 0; // SHA-NI: no AVX dependency
++		have_avx2  = osavx && ((ebx & (1U << 5)) != 0);
++	}
++
++	// SHA1 rounds: SHA-NI > SSE2 > scalar  (hashing.cpp dispatch)
++	const char *sha1_rounds = have_shani ? "SHA-NI" : (have_sse2 ? "SSE2" : "scalar");
++	// SHA1 byteswap: AVX2 > SSSE3 > scalar  (hashing.cpp dispatch)
++	const char *sha1_swap   = have_avx2 ? "AVX2" : (have_ssse3 ? "SSSE3" : "scalar");
++	// inflate: zlib-ng runtime dispatch (AVX2 > SSSE3 > SSE2)
++	const char *inflate     = have_avx2 ? "AVX2" : (have_ssse3 ? "SSSE3" : (have_sse2 ? "SSE2" : "scalar"));
++	// FLAC: highest path enabled by FLAC's cpu.c dispatch
++	const char *flac;
++	if      (have_avx2 && have_fma) flac = "AVX2+FMA";
++	else if (have_avx2)             flac = "AVX2";
++	else if (have_sse42)            flac = "SSE4.2";
++	else if (have_ssse3)            flac = "SSSE3";
++	else if (have_sse2)             flac = "SSE2";
++	else                            flac = "scalar";
++	// LZMA decoder: compile-time ASM (LzmaDecOpt) or C fallback
++	const char *lzma = (HAVE_LZMA_ASM) ? "ASM" : "C";
++
++	char buf[128];
++	snprintf(buf, sizeof(buf), "[SHA1=%s+%s  inflate=%s  FLAC=%s  LZMA=%s]",
++		sha1_rounds, sha1_swap, inflate, flac, lzma);
++	return buf;
++}
++
++
++//-------------------------------------------------
+ //  main - entry point
+ //-------------------------------------------------
+ 
+@@ -3426,12 +3614,13 @@
+ 
+ 	// print the header
+ 	extern const char build_version[];
+-	util::stream_format(std::cout, "chdman - MAME Compressed Hunks of Data (CHD) manager %s\n", build_version);
++	util::stream_format(std::cout, "chdman - MAME Compressed Hunks of Data (CHD) manager %s  %s\n",
++		build_version, simd_active_string());
+ 
+ 	// handle help specially
+ 	if (args.size() < 2)
+ 		return print_help(args[0]);
+-	int argnum = 1;
++	std::size_t argnum = 1;
+ 	std::string command = args[argnum++];
+ 	bool help(command == COMMAND_HELP);
+ 	if (help)
+@@ -3442,6 +3631,98 @@
+ 	}
+ 
+ 	// iterate over commands to find our match
++	for (auto & s_command : s_commands)
++	{
++		if (command == s_command.name)
++		{
++			const command_description &desc = s_command;
++
++			// print help if that was requested
++			if (help)
++				return print_help(args[0], desc);
++
++			// otherwise, verify the parameters
++			parameters_map parameters;
++			while (argnum < args.size())
++			{
++				// should be an option name
++				const std::string &arg = args[argnum++];
++				if (arg.empty() || (arg[0] != '-'))
++					return print_help(args[0], desc, "Expected option, not parameter");
++
++				// iterate over valid options
++				std::size_t valid;
++				for (valid = 0; (valid < std::size(desc.valid_options)) && desc.valid_options[valid]; ++valid)
++				{
++					// reduce to the option name
++					const char *validname = desc.valid_options[valid];
++					if (*validname == REQUIRED[0])
++						validname++;
++
++					// find the matching option description
++					std::size_t optnum;
++					for (optnum = 0; optnum < std::size(s_options); ++optnum)
++						if (strcmp(s_options[optnum].name, validname) == 0)
++							break;
++					assert(optnum != std::size(s_options));
++
++					// do we match?
++					const option_description &odesc = s_options[optnum];
++					if ((arg.size() >= 2 && arg[1] == '-' && strcmp(odesc.name, &arg[2]) == 0) ||
++						(arg.size() >= 2 && arg[1] != '-' && odesc.shortname != nullptr && strcmp(odesc.shortname, &arg[1]) == 0))
++					{
++						// if we need a parameter, consume it
++						const char *param = "";
++						if (odesc.parameter)
++						{
++							if (argnum >= args.size() || (!args[argnum].empty() && args[argnum][0] == '-'))
++								return print_help(args[0], desc, "Option is missing parameter");
++							param = args[argnum++].c_str();
++						}
++
++						// add to the map
++						if (!parameters.insert(std::make_pair(odesc.name, new std::string(param))).second)
++							return print_help(args[0], desc, "Multiple parameters of the same type specified");
++						break;
++					}
++				}
++			}
++
++			// make sure we got all our required parameters
++			for (std::size_t valid = 0; valid < std::size(desc.valid_options); valid++)
++			{
++				const char *validname = desc.valid_options[valid];
++				if (validname == nullptr)
++					break;
++				if (*validname == REQUIRED[0] && parameters.find(++validname) == parameters.end())
++					return print_help(args[0], desc, "Required parameters missing");
++			}
++
++			// all clear, run the command
++			try
++			{
++				(*s_command.handler)(parameters);
++				return 0;
++			}
++			catch (std::error_condition const &err)
++			{
++				util::stream_format(std::cerr, "CHD error occurred (main): %s\n", err.message());
++				return 1;
++			}
++			catch (fatal_error &err)
++			{
++				util::stream_format(std::cerr, "Fatal error occurred: %d\n", err.error());
++				return err.error();
++			}
++			catch (std::exception& ex)
++			{
++				util::stream_format(std::cerr, "Unhandled exception: %s\n", ex.what());
++				return 1;
++			}
++		}
++	}
++
++	// iterate over commands to find our match
+ 	for (auto & s_command : s_commands)
+ 	{
+ 		if (command == s_command.name)
