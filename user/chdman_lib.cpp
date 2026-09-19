@@ -1,9 +1,10 @@
 #include "chdman_lib.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <sstream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,86 @@
  */
 int chdman_cli_entry(int argc, char* argv[]);
 
-int chdman_run(int argc, const char* const* argv, char** out_log)
+namespace
+{
+// Intercepts std::cout/std::cerr writes character-by-character, splitting them into
+// lines on '\r' or '\n' (chdman uses '\r' for in-place progress updates and '\n' for
+// ordinary messages -- see chdman.cpp's progress()/report_error()). Each completed line
+// is both appended to the full accumulated log text and, if a callback was given,
+// parsed for a "<float>% complete" segment (chdman's consistent progress format) and
+// delivered live.
+class chdman_capture_streambuf : public std::streambuf
+{
+public:
+    chdman_capture_streambuf(ChdmanProgressCb cb, void* user_data) : m_cb(cb), m_user_data(user_data) {}
+
+    const std::string& text() const { return m_text; }
+
+protected:
+    int_type overflow(int_type ch) override
+    {
+        if (traits_type::eq_int_type(ch, traits_type::eof()))
+            return traits_type::not_eof(ch);
+
+        const char c = traits_type::to_char_type(ch);
+        m_text.push_back(c);
+
+        if (c == '\n' || c == '\r')
+            flush_line();
+        else
+            m_line.push_back(c);
+
+        return ch;
+    }
+
+    int sync() override
+    {
+        if (!m_line.empty())
+            flush_line();
+        return 0;
+    }
+
+private:
+    void flush_line()
+    {
+        if (m_cb)
+            m_cb(m_line.c_str(), parse_percent(m_line), m_user_data);
+        m_line.clear();
+    }
+
+    // Looks for "<float>% complete" -- e.g. "Compressing, 45.3% complete... (ratio=61.2%)"
+    // -- and returns the parsed float, or -1.0f if the line doesn't contain one.
+    static float parse_percent(const std::string& line)
+    {
+        static const std::string marker = "% complete";
+        const size_t marker_pos = line.find(marker);
+        if (marker_pos == std::string::npos)
+            return -1.0f;
+
+        size_t start = marker_pos;
+        while (start > 0 && (std::isdigit(static_cast<unsigned char>(line[start - 1])) || line[start - 1] == '.'))
+            --start;
+        if (start == marker_pos)
+            return -1.0f;
+
+        try
+        {
+            return std::stof(line.substr(start, marker_pos - start));
+        }
+        catch (...)
+        {
+            return -1.0f;
+        }
+    }
+
+    ChdmanProgressCb m_cb;
+    void* m_user_data;
+    std::string m_text;
+    std::string m_line;
+};
+}  // namespace
+
+int chdman_run(int argc, const char* const* argv, char** out_log, ChdmanProgressCb on_progress, void* user_data)
 {
     // chdman's main() expects argv[0] to be the program name (used only in help/usage
     // text) and argv[1] to be the command name. The public API here takes just the
@@ -40,9 +120,10 @@ int chdman_run(int argc, const char* const* argv, char** out_log)
     for (auto& s : owned)
         mutable_argv.push_back(s.data());
 
-    std::ostringstream captured;
-    std::streambuf* old_cout = std::cout.rdbuf(captured.rdbuf());
-    std::streambuf* old_cerr = std::cerr.rdbuf(captured.rdbuf());
+    chdman_capture_streambuf capture_buf(on_progress, user_data);
+    std::ostream capture_stream(&capture_buf);
+    std::streambuf* old_cout = std::cout.rdbuf(&capture_buf);
+    std::streambuf* old_cerr = std::cerr.rdbuf(&capture_buf);
 
     int rc = 1;
     try
@@ -51,7 +132,7 @@ int chdman_run(int argc, const char* const* argv, char** out_log)
     }
     catch (...)
     {
-        captured << "chdman_run: unhandled exception escaped chdman's command dispatch\n";
+        capture_stream << "chdman_run: unhandled exception escaped chdman's command dispatch\n";
         rc = 1;
     }
 
@@ -60,7 +141,7 @@ int chdman_run(int argc, const char* const* argv, char** out_log)
 
     if (out_log)
     {
-        const std::string text = captured.str();
+        const std::string& text = capture_buf.text();
         char* buf = static_cast<char*>(std::malloc(text.size() + 1));
         if (buf)
             std::memcpy(buf, text.c_str(), text.size() + 1);

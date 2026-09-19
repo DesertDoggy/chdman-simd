@@ -176,8 +176,16 @@ CFLAGS = -O3 -fPIC $(MARCH_BASE) -g \
 EXTRA_CFLAGS ?=
 CFLAGS += $(EXTRA_CFLAGS)
 
-LOG      = build/build.log
-WARN_LOG = 2>>$(LOG)
+# Originally redirected stderr to a log file to keep warnings off the terminal, but that
+# unconditionally caught real compile ERRORS too (confirmed directly: a genuine missing-
+# header error for aes256cbc.cpp was completely invisible at the terminal, discoverable
+# only by manually reading build/build.log afterward -- a real cost to debuggability for
+# a cosmetic benefit). Piping through `tee` instead isn't a safe fix here without bash-
+# specific process substitution (a plain `| tee` pipe would make `make` see tee's exit
+# code instead of the compiler's, silently turning failed compiles into "successful"
+# ones) -- so this is intentionally a no-op: compiler output, warnings included, just
+# goes straight to the terminal like normal.
+WARN_LOG =
 
 comma := ,
 LDFLAGS = $(SHARED_FLAG) $(STATIC_RUNTIME) -s \

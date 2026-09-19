@@ -163,23 +163,45 @@ esac
 # Scratch source copy: MAME src/ + curated 3rdparty/, with chdman-simd's patches
 # applied. Lives entirely under user/_build -- never touches mame/ or chdman-simd/'s
 # own tracked files.
+#
+# Source is extracted via `git archive` at whatever MAME commit chdman-simd's own docs
+# say its patches target (parsed from patches/APPLY_PATCHES.md's "Generated from MAME
+# **X.YYY**"), NOT from submodules/mame's currently checked-out commit. Both mame/ and
+# chdman-simd/ are submodules the user updates on their own schedule (tracking newer
+# MAME releases, newer chdman-simd patch sets); this keeps the build correct regardless
+# of what commit mame/ happens to be sitting on, as long as that release's history is
+# present in mame/'s git objects (it must have been fetched at some point -- e.g. by
+# ever having been checked out, or by `git fetch --tags` -- but need not be HEAD now).
 # ---------------------------------------------------------------------------
 src_copy="$user_dir/_build/$platform/$arch/src"
 rm -rf "$src_copy"
 mkdir -p "$src_copy"
 
-echo "[INFO] Copying MAME src/ ..." | tee -a "$log_file"
-cp -r "$mame_src/src" "$src_copy/"
+patches_doc="$submodule_root/patches/APPLY_PATCHES.md"
+[[ -f "$patches_doc" ]] || { echo "[ERROR] $patches_doc not found -- can't determine required MAME version" >&2; exit 3; }
+mame_version="$(sed -n 's/.*Generated from MAME \*\*\([0-9][0-9.]*\)\*\*.*/\1/p' "$patches_doc" | head -1)"
+[[ -n "$mame_version" ]] || { echo "[ERROR] Could not parse required MAME version from $patches_doc" >&2; exit 3; }
+
+# MAME's own release process consistently commits a single "Bumped version to X.YYY"
+# right at each release point (confirmed against this repo's actual history) -- search
+# every ref, not just whatever's currently checked out, since the needed commit may not
+# be reachable from mame/'s current HEAD.
+mame_commit="$(git -C "$mame_src" log --all --format='%H %s' 2>/dev/null | grep -i "Bumped version to ${mame_version}\$" | head -1 | cut -d' ' -f1)"
+if [[ -z "$mame_commit" ]]; then
+  echo "[ERROR] No 'Bumped version to $mame_version' commit found in submodules/mame's history." >&2
+  echo "[ERROR] chdman-simd's patches target MAME $mame_version -- fetch that release into" >&2
+  echo "[ERROR] submodules/mame (it doesn't need to be checked out) and try again." >&2
+  exit 3
+fi
+echo "[INFO] chdman-simd targets MAME $mame_version -> using commit $mame_commit" | tee -a "$log_file"
+
+echo "[INFO] Extracting MAME src/ at $mame_commit ..." | tee -a "$log_file"
+git -C "$mame_src" archive "$mame_commit" -- src | tar -x -C "$src_copy"
 
 if [[ ! -f "$src_copy/src/version.cpp" ]]; then
-  if [[ -f "$mame_src/build/generated/version.cpp" ]]; then
-    cp "$mame_src/build/generated/version.cpp" "$src_copy/src/version.cpp"
-  else
-    mame_ver="$(basename "$(git -C "$mame_src" describe --tags 2>/dev/null || echo mame0000)" | grep -oE '[0-9]{3,4}' | head -1)"
-    mame_ver="${mame_ver:-0000}"
-    cat > "$src_copy/src/version.cpp" <<EOF
-#define BARE_BUILD_VERSION "0.${mame_ver}"
-#define BARE_VCS_REVISION "unknown"
+  cat > "$src_copy/src/version.cpp" <<EOF
+#define BARE_BUILD_VERSION "$mame_version"
+#define BARE_VCS_REVISION "$mame_commit"
 extern const char bare_build_version[];
 extern const char bare_vcs_revision[];
 extern const char build_version[];
@@ -187,14 +209,39 @@ const char bare_build_version[] = BARE_BUILD_VERSION;
 const char bare_vcs_revision[]  = BARE_VCS_REVISION;
 const char build_version[]      = BARE_BUILD_VERSION " (" BARE_VCS_REVISION ")";
 EOF
-  fi
 fi
 
-echo "[INFO] Copying 3rdparty/ ..." | tee -a "$log_file"
+# Exact subpaths actually needed -- not whole library trees. This matters beyond
+# leanness: 3rdparty/zstd's tests/ subtree (irrelevant to the build) contains a symlink,
+# which `tar -x` can't create on Windows without elevated privileges (confirmed
+# directly), aborting the whole extraction. Narrowing to just what's needed avoids
+# pulling that in at all.
+#
+# aes256cbc/nanosvg ARE needed despite not appearing in Makefile.chdman_lib's own -I/
+# *_CSRCS lists (confirmed directly, the hard way): src/lib/util/aes256cbc.cpp and
+# nanosvg.cpp are thin wrapper files (part of UTIL_SRCS, always compiled) that
+# `#include <aes256cbc/AES_256_CBC.h>` / `#include <nanosvg/src/nanosvg.h>` -- resolved
+# via the Makefile's generic `-I3rdparty` root, not an aes256cbc/nanosvg-specific -I, so
+# grepping the Makefile for explicit $(TP)/aes256cbc-style references misses this
+# dependency entirely. Omitting them doesn't fail the extraction or the configure step --
+# it fails silently later, deep in a parallel build, as a g++ error that (because
+# Makefile.chdman_lib redirects warnings, but ends up catching real errors too, to
+# build/build.log) never reaches the terminal at all.
+echo "[INFO] Extracting 3rdparty/ at $mame_commit ..." | tee -a "$log_file"
 mkdir -p "$src_copy/3rdparty"
-for lib in lzma utf8proc expat zstd flac aes256cbc nanosvg; do
-  if [[ -d "$mame_src/3rdparty/$lib" ]]; then
-    cp -r "$mame_src/3rdparty/$lib" "$src_copy/3rdparty/"
+for subpath in \
+  lzma/C \
+  lzma/Asm \
+  utf8proc \
+  expat/lib \
+  zstd/lib \
+  flac/include \
+  flac/src \
+  aes256cbc \
+  nanosvg
+do
+  if git -C "$mame_src" cat-file -e "$mame_commit:3rdparty/$subpath" 2>/dev/null; then
+    git -C "$mame_src" archive "$mame_commit" -- "3rdparty/$subpath" | tar -x -C "$src_copy"
   fi
 done
 
@@ -213,7 +260,10 @@ for patch in "$submodule_root"/patches/0*.patch; do
     patch -p1 --fuzz=5 < "$patch"
     echo "    [OK] $name (with fuzz)" | tee -a "$log_file"
   else
-    echo "    [FAIL] $name -- manual merge required (see chdman-simd/patches/APPLY_PATCHES.md)" | tee -a "$log_file"
+    echo "    [FAIL] $name -- manual merge required (see chdman-simd/patches/APPLY_PATCHES.md)." | tee -a "$log_file"
+    echo "    [FAIL] This means MAME $mame_version's source itself doesn't match what chdman-simd" | tee -a "$log_file"
+    echo "    [FAIL] expects, despite being the commit its own docs say to target -- check whether" | tee -a "$log_file"
+    echo "    [FAIL] chdman-simd's patches or its version claim in patches/APPLY_PATCHES.md are stale." | tee -a "$log_file"
     exit 4
   fi
 done
@@ -248,7 +298,16 @@ if [[ ! -f "$zlibng_lib" ]]; then
     -DZLIB_COMPAT=ON -DBUILD_SHARED_LIBS=OFF -DZLIB_ENABLE_TESTS=OFF -DWITH_GTEST=OFF \
     -DCMAKE_C_FLAGS="-O3 $MARCH_EXTRA" \
     "${cmake_extra_args[@]}" 2>&1 | tee -a "$log_file"
-  cmake --build "$zlibng_build" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" 2>&1 | tee -a "$log_file"
+  # --target zlib-ng only (produces libz.a) -- the default "all" target also builds
+  # zlib-ng's own dev/test utility executables (utils/CMakeLists.txt's maketrees.exe,
+  # makefixed.exe, minigzip.exe, etc), which aren't needed for the static lib chdman
+  # actually links (they only feed zlib-ng's own test suite, already disabled above via
+  # ZLIB_ENABLE_TESTS=OFF -- but utils/ itself still builds unconditionally regardless of
+  # that flag). Skipping them avoids some freshly-built, unsigned .exe files that some
+  # antivirus (confirmed: Norton) flags/quarantines on sight, which was also intermittently
+  # breaking the build outright (a locked/quarantined maketrees.exe made the subsequent
+  # link step fail with "Permission denied").
+  cmake --build "$zlibng_build" --target zlib-ng -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" 2>&1 | tee -a "$log_file"
 fi
 
 [[ -f "$zlibng_lib" ]] || { echo "[ERROR] zlib-ng build did not produce $zlibng_lib" >&2; exit 5; }

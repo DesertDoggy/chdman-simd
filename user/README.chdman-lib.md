@@ -34,12 +34,15 @@ under `submodules/`.
 
 ## API
 Header: `user/chdman_lib.h`
-- `chdman_run(argc, argv, out_log)` -- runs chdman with the same command-line arguments
-  the CLI takes (`createcd`, `extractcd`, `createdvd`, `createhd`, `info`, `verify`, ...).
-  `argv` excludes the program name: `argv[0]` is the command, followed by its options and
-  values, exactly as documented by `chdman help <command>`. Returns the same exit code
-  the CLI would. Captured stdout/stderr text is returned via `out_log` (caller frees with
-  `chdman_free_log`).
+- `chdman_run(argc, argv, out_log, on_progress, user_data)` -- runs chdman with the same
+  command-line arguments the CLI takes (`createcd`, `extractcd`, `createdvd`, `createhd`,
+  `info`, `verify`, ...). `argv` excludes the program name: `argv[0]` is the command,
+  followed by its options and values, exactly as documented by `chdman help <command>`.
+  Returns the same exit code the CLI would. `on_progress` (may be NULL) is called live,
+  once per line chdman writes to stdout/stderr, with a parsed percentage when the line
+  matches chdman's `"<float>% complete"` format (-1.0f otherwise) -- this is how a caller
+  sees progress during long-running commands. The full accumulated stdout/stderr text is
+  also returned via `out_log` regardless (caller frees with `chdman_free_log`).
 - `chdman_free_log(log)`
 
 Not safe to call concurrently with itself -- chdman's command handlers use process-wide
