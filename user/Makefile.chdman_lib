@@ -411,10 +411,14 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS)
 
-# chdman.cpp's main() -> chdman_cli_entry: see user/chdman_lib.cpp for why.
+# chdman.cpp's main() -> chdman_cli_entry, and its osd_get_command_line() call ->
+# chdman_lib_get_command_line(): see user/chdman_lib.cpp for why (the latter works around
+# osd_get_command_line ignoring its own argc/argv and re-fetching the real OS process
+# command line on Windows, which is wrong once chdman is a library call inside another
+# process).
 $(BUILDDIR)/$(S)/tools/chdman.o: $(S)/tools/chdman.cpp
 	@mkdir -p $(dir $@) $(dir $(LOG))
-	$(CXX) $(CXXFLAGS) -Dmain=chdman_cli_entry -c $< -o $@ $(WARN_LOG)
+	$(CXX) $(CXXFLAGS) -Dmain=chdman_cli_entry -Dosd_get_command_line=chdman_lib_get_command_line -c $< -o $@ $(WARN_LOG)
 
 $(BUILDDIR)/%.o: %.cpp
 	@mkdir -p $(dir $@) $(dir $(LOG))

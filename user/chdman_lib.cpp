@@ -25,6 +25,36 @@
  */
 int chdman_cli_entry(int argc, char* argv[]);
 
+/*
+ * chdman.cpp's main() doesn't use its own argc/argv directly -- it calls
+ * `osd_get_command_line(argc, argv)` (src/osd/osdcore.cpp) first, expecting that to just
+ * wrap the two into a vector<string>. On Windows, though, that function *ignores both
+ * parameters* and instead calls `CommandLineToArgvW(GetCommandLineW(), &count)` -- it
+ * re-fetches the *real OS process command line* rather than trusting what was passed in.
+ * That's fine for a real chdman.exe process (its argc/argv and the OS command line are the
+ * same thing), but fatal for chdman running as a library call inside another process: this
+ * process's actual command line is the *host* program's (the Rust test binary's, here),
+ * which chdman then sees as "no command given" and responds with the top-level usage
+ * listing to every single call, regardless of what argv chdman_run() was actually given.
+ *
+ * Same fix as `main` above: compiled into chdman.cpp's call site via
+ * `-Dosd_get_command_line=chdman_lib_get_command_line` (see Makefile.chdman_lib), this
+ * function is what chdman.cpp actually calls instead, doing only the straightforward
+ * "wrap argc/argv into a vector<string>" job the real one is supposed to do -- matching
+ * osdcore.cpp's own non-Windows branch, which has no OS-command-line-refetching problem to
+ * begin with. osdcore.cpp itself is untouched; other, real chdman.exe-style consumers of
+ * `osd_get_command_line` elsewhere in a link are unaffected, since `-D` is scoped to this
+ * one translation unit.
+ */
+std::vector<std::string> chdman_lib_get_command_line(int argc, char* argv[])
+{
+    std::vector<std::string> args;
+    args.reserve(static_cast<size_t>(argc));
+    for (int i = 0; i < argc; ++i)
+        args.emplace_back(argv[i] ? argv[i] : "");
+    return args;
+}
+
 namespace
 {
 // Intercepts std::cout/std::cerr writes character-by-character, splitting them into

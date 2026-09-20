@@ -53,6 +53,16 @@ state (the shared CHD compressor thread pool). Serialize calls.
   (see `Makefile.chdman_lib`), renaming the entry point at the preprocessor level so the
   wrapper in `chdman_lib.cpp` can call it as an ordinary function while reusing chdman's
   real, unmodified command dispatch (`s_commands[]` lookup, option parsing, error handling).
+- Same trick, same file, for one more call: `main()`'s first line calls
+  `osd_get_command_line(argc, argv)` expecting it to just wrap the two into a
+  `vector<string>` -- but on Windows that function ignores both and instead re-fetches the
+  real OS process command line via `GetCommandLineW()`. That's correct for a real
+  `chdman.exe` process, and wrong for chdman running as a library call inside another
+  process (it would see *that other process's* command line, not the argv `chdman_run()`
+  was actually given). `-Dosd_get_command_line=chdman_lib_get_command_line` redirects that
+  one call, inside this one translation unit only, to a matching function in
+  `chdman_lib.cpp` that does only the straightforward wrap-argc/argv-into-a-vector job.
+  `src/osd/osdcore.cpp`'s real `osd_get_command_line` is untouched.
 - On non-Windows platforms, MAME's own `osdlib_unix.cpp`/`osdlib_macosx.cpp` are **not**
   used -- both unconditionally pull in SDL2, which a batch CLI tool never needs.
   `user/osdlib_posix_min.cpp` implements just the handful of `osd_*` symbols chdman's link
