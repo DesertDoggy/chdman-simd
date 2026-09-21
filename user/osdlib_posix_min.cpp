@@ -9,9 +9,11 @@
 // osdlib_macosx.cpp on non-Windows targets.
 //
 // If a future chdman/MAME util change references another osd_* symbol not implemented
-// in osdcore.cpp (shared, unchanged across platforms) or here, the linker will report an
-// undefined symbol naming it -- add a minimal implementation here rather than pulling in
-// the full SDL-based osdlib_unix.cpp/osdlib_macosx.cpp.
+// in osdcore.cpp (shared, unchanged across platforms) or here, add a minimal
+// implementation here rather than pulling in the full SDL-based
+// osdlib_unix.cpp/osdlib_macosx.cpp. A shared library links fine with undefined symbols
+// and only fails when the missing one is first called, so the Linux link uses
+// -Wl,-z,defs (see Makefile.chdman_lib) to surface it at build time instead.
 
 #include "osdcore.h"
 #include "modules/lib/osdlib.h"
@@ -32,6 +34,11 @@ void osd_process_kill()
 #else
     _exit(-1);
 #endif
+}
+
+const char *osd_getenv(const char *name)
+{
+    return getenv(name);
 }
 
 int osd_setenv(const char *name, const char *value, int overwrite)

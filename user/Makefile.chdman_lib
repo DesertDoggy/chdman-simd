@@ -106,7 +106,7 @@ else
 
   ifeq ($(PLATFORM),linux)
     TARGET_NAME = libchdman.so
-    SHARED_FLAG = -shared -fPIC
+    SHARED_FLAG = -shared -fPIC -Wl,-z,defs
     PLATFORM_LDLIBS = -lpthread -ldl -lm
   else ifeq ($(PLATFORM),mac)
     TARGET_NAME = libchdman.dylib
