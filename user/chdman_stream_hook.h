@@ -32,6 +32,14 @@ bool emit(const std::string &file_name, uint64_t offset, const void *data, uint3
 // False when the active stream is stream-only (no bytes to disk).
 bool write_enabled();
 
+// Input side (osd_file::open hook in user/patches/streaming/07_*): if `path` names a source
+// registered by the active chdman_create_from_sources call, opens it as a read-only
+// virtual file, stores the result in `err` and returns true. Otherwise returns false and
+// the real open proceeds. Declared with void* to keep osdfile.h out of this header:
+// `file` is an osd_file::ptr*.
+bool open_virtual(const std::string &path, std::uint32_t openflags, void *file,
+                  std::uint64_t &filesize, std::error_condition &err);
+
 // Stand-in for util::write's result when write_enabled() is false.
 inline std::pair<std::error_condition, std::size_t> skipped_write(std::size_t length)
 {

@@ -14,9 +14,15 @@
 #include "cdrom.h"
 #include "chd.h"
 #include "ioprocs.h"
+#include "osdfile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
 #include <cstdlib>
 #include <cstring>
 #include <list>
@@ -433,4 +439,270 @@ int chdman_reader_read_sector(ChdmanReader *reader, uint32_t lba, void *buffer, 
 const char *chdman_reader_last_error(void)
 {
 	return t_reader_error.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// Creation from caller sources: virtual files behind osd_file::open
+// ---------------------------------------------------------------------------
+
+namespace {
+
+namespace fs = std::filesystem;
+
+std::string normalize_path(const std::string &path)
+{
+	return fs::u8path(path).lexically_normal().generic_u8string();
+}
+
+// Sources of the active chdman_create_from_sources call, by normalized virtual path.
+// Like g_stream: one call at a time (chdman_run's own rule).
+std::map<std::string, const ChdmanSource *> *g_virtual = nullptr;
+
+// Read-only osd_file over a ChdmanSource. read_at sources are read directly. Sequential
+// sources are read forward into a history window, so chdman's reads (in order, with
+// occasional small steps back from its buffering) are served; a read before the window
+// fails.
+class virtual_osd_file : public osd_file
+{
+public:
+	explicit virtual_osd_file(const ChdmanSource &source) : m_source(source) {}
+
+	std::error_condition read(void *buffer, std::uint64_t offset, std::uint32_t length, std::uint32_t &actual) noexcept override
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		actual = 0;
+		if (offset >= m_source.size || length == 0)
+			return std::error_condition();
+		const std::uint32_t len = std::uint32_t(std::min<std::uint64_t>(length, m_source.size - offset));
+		auto *out = static_cast<std::uint8_t *>(buffer);
+
+		if (m_source.read_at)
+		{
+			if (m_source.read_at(m_source.user_data, offset, out, len) != 0)
+				return std::errc::io_error;
+			actual = len;
+			return std::error_condition();
+		}
+
+		if (offset < m_history_start)
+			return std::errc::invalid_seek;
+		const std::uint64_t end = offset + len;
+		try
+		{
+			while (m_pos < end)
+			{
+				const std::uint64_t want = std::min<std::uint64_t>(1u << 20, m_source.size - m_pos);
+				const std::size_t old = m_history.size();
+				m_history.resize(old + want);
+				const std::int64_t n = m_source.read(m_source.user_data, m_history.data() + old, want);
+				if (n <= 0 || std::uint64_t(n) > want)
+				{
+					m_history.resize(old);
+					return std::errc::io_error;
+				}
+				m_history.resize(old + std::size_t(n));
+				m_pos += std::uint64_t(n);
+				trim(offset);
+			}
+		}
+		catch (...)
+		{
+			return std::errc::not_enough_memory;
+		}
+		std::memcpy(out, m_history.data() + (offset - m_history_start), len);
+		actual = len;
+		trim(offset);
+		return std::error_condition();
+	}
+
+	std::error_condition write(void const *, std::uint64_t, std::uint32_t, std::uint32_t &actual) noexcept override
+	{
+		actual = 0;
+		return std::errc::read_only_file_system;
+	}
+	std::error_condition truncate(std::uint64_t) noexcept override { return std::errc::read_only_file_system; }
+	std::error_condition flush() noexcept override { return std::error_condition(); }
+
+private:
+	static constexpr std::uint64_t WINDOW = 32u << 20;
+
+	// Drops history older than WINDOW behind the current position, but never bytes at or
+	// after `keep_from` (the read in progress).
+	void trim(std::uint64_t keep_from)
+	{
+		const std::uint64_t floor = std::min(keep_from, m_pos > WINDOW ? m_pos - WINDOW : 0);
+		if (floor > m_history_start && floor - m_history_start >= WINDOW)
+		{
+			const std::size_t drop = std::size_t(floor - m_history_start);
+			m_history.erase(m_history.begin(), m_history.begin() + drop);
+			m_history_start = floor;
+		}
+	}
+
+	const ChdmanSource &m_source;
+	std::mutex m_mutex;
+	std::vector<std::uint8_t> m_history;  // bytes [m_history_start, m_pos)
+	std::uint64_t m_history_start = 0;
+	std::uint64_t m_pos = 0;
+};
+
+bool read_source_fully(const ChdmanSource &source, std::vector<std::uint8_t> &out)
+{
+	out.resize(std::size_t(source.size));
+	if (source.read_at)
+		return source.size == 0 || source.read_at(source.user_data, 0, out.data(), source.size) == 0;
+	std::uint64_t got = 0;
+	while (got < source.size)
+	{
+		const std::int64_t n = source.read(source.user_data, out.data() + got, source.size - got);
+		if (n <= 0)
+			return false;
+		got += std::uint64_t(n);
+	}
+	return true;
+}
+
+void set_log(char **out_log, const std::string &text)
+{
+	if (!out_log)
+		return;
+	*out_log = static_cast<char *>(std::malloc(text.size() + 1));
+	if (*out_log)
+		std::memcpy(*out_log, text.c_str(), text.size() + 1);
+}
+
+} // namespace
+
+bool chdman_stream::open_virtual(const std::string &path, std::uint32_t openflags, void *file,
+                                 std::uint64_t &filesize, std::error_condition &err)
+{
+	if (!g_virtual)
+		return false;
+	const auto found = g_virtual->find(normalize_path(path));
+	if (found == g_virtual->end())
+		return false;
+	if (openflags & (OPEN_FLAG_WRITE | OPEN_FLAG_CREATE))
+	{
+		err = std::errc::read_only_file_system;
+		return true;
+	}
+	try
+	{
+		*static_cast<osd_file::ptr *>(file) = std::make_unique<virtual_osd_file>(*found->second);
+	}
+	catch (...)
+	{
+		err = std::errc::not_enough_memory;
+		return true;
+	}
+	filesize = found->second->size;
+	err = std::error_condition();
+	return true;
+}
+
+int chdman_create_from_sources(int argc, const char *const *argv, const ChdmanSource *sources, int count,
+                               char **out_log, ChdmanProgressCb on_progress, void *user_data)
+{
+	if (argc < 1 || !argv || !argv[0] || !sources || count <= 0)
+	{
+		set_log(out_log, "chdman_create_from_sources: invalid arguments\n");
+		return 1;
+	}
+	const std::string command = argv[0];
+	if (command != "createraw" && command != "createhd" && command != "createdvd" && command != "createcd")
+	{
+		set_log(out_log, "chdman_create_from_sources: unsupported command (createraw/createhd/createdvd/createcd only)\n");
+		return 1;
+	}
+	for (int i = 0; i < count; i++)
+	{
+		if (!sources[i].name || !*sources[i].name || (!sources[i].read && !sources[i].read_at))
+		{
+			set_log(out_log, "chdman_create_from_sources: every source needs a name and read or read_at\n");
+			return 1;
+		}
+	}
+
+	// The -i value must name a source; it is rewritten to that source's virtual path.
+	std::vector<std::string> args(argv, argv + argc);
+	const ChdmanSource *input = nullptr;
+	for (std::size_t i = 0; i + 1 < args.size(); i++)
+	{
+		if (args[i] != "-i" && args[i] != "--input")
+			continue;
+		for (int k = 0; k < count && !input; k++)
+			if (args[i + 1] == sources[k].name)
+				input = &sources[k];
+		if (!input)
+		{
+			set_log(out_log, "chdman_create_from_sources: -i does not name one of the sources\n");
+			return 1;
+		}
+		break;
+	}
+	if (!input)
+	{
+		set_log(out_log, "chdman_create_from_sources: -i is required\n");
+		return 1;
+	}
+
+	// Private directory: holds the (materialized) sheet, and anchors the virtual paths so a
+	// sheet's relative track references resolve to them.
+	std::error_code ec;
+	const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+	const fs::path dir = fs::temp_directory_path(ec) / ("chdman_sources_" + std::to_string(stamp));
+	if (ec || !fs::create_directories(dir, ec))
+	{
+		set_log(out_log, "chdman_create_from_sources: cannot create a temporary directory\n");
+		return 1;
+	}
+
+	std::map<std::string, const ChdmanSource *> registry;
+	int rc = 1;
+	try
+	{
+		for (int k = 0; k < count; k++)
+		{
+			const fs::path path = dir / fs::u8path(sources[k].name);
+			const bool is_sheet = command == "createcd" && &sources[k] == input;
+			if (is_sheet)
+			{
+				std::vector<std::uint8_t> text;
+				if (!read_source_fully(sources[k], text))
+				{
+					set_log(out_log, "chdman_create_from_sources: reading the sheet source failed\n");
+					fs::remove_all(dir, ec);
+					return 1;
+				}
+				fs::create_directories(path.parent_path(), ec);
+				std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(text.data()), std::streamsize(text.size()));
+			}
+			else
+			{
+				registry[normalize_path(path.u8string())] = &sources[k];
+			}
+			if (&sources[k] == input)
+			{
+				for (std::size_t i = 0; i + 1 < args.size(); i++)
+					if (args[i] == "-i" || args[i] == "--input")
+						args[i + 1] = path.u8string();
+			}
+		}
+
+		std::vector<const char *> argv2;
+		for (const std::string &a : args)
+			argv2.push_back(a.c_str());
+
+		g_virtual = &registry;
+		rc = chdman_run(int(argv2.size()), argv2.data(), out_log, on_progress, user_data);
+		g_virtual = nullptr;
+	}
+	catch (...)
+	{
+		g_virtual = nullptr;
+		set_log(out_log, "chdman_create_from_sources: unexpected exception\n");
+		rc = 1;
+	}
+	fs::remove_all(dir, ec);
+	return rc;
 }
