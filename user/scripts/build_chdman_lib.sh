@@ -12,6 +12,15 @@ set -euo pipefail
 # Usage:
 #   user/scripts/build_chdman_lib.sh                      # auto-detect host platform/arch
 #   user/scripts/build_chdman_lib.sh <platform> <arch>
+#   user/scripts/build_chdman_lib.sh --streaming [<platform> <arch>]
+#
+# --streaming builds the streaming variant: additionally applies
+# user/patches/streaming/*.patch (write-site hook in chdman.cpp's extract loops) and
+# compiles user/chdman_stream.cpp (chdman_extract_stream + the chdman_reader_* random
+# access API, see chdman_lib.h) with -DCHDMAN_WITH_STREAMING. It uses its own scratch
+# source/object dirs under user/_build/with_streaming/ and installs to
+# user/release/with_streaming/<platform>/<arch>/<version>/, so both variants coexist and
+# the default build's sources, flags, exports and output path are unchanged.
 #
 # Targets:
 #   windows/x64   linux/x64   mac/arm64   android/arm64   ios/arm64
@@ -19,6 +28,22 @@ set -euo pipefail
 # Cross-compiling (android/ios, or windows/linux from a different host) requires the
 # right toolchain already installed -- see the per-platform notes below and
 # user/docs/README.chdman-lib.md.
+
+streaming=0
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --streaming) streaming=1 ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+# Per-variant path segment under user/_build and user/release. A separate scratch source
+# and object dir per variant is mandatory, not tidiness: Makefile.chdman_lib has no
+# header/flag dependency tracking, so a shared BUILDDIR would silently link objects
+# compiled for the other variant.
+variant_dir=""
+(( streaming )) && variant_dir="with_streaming/"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 user_dir="$(cd "$script_dir/.." && pwd)"
@@ -55,7 +80,7 @@ elif [[ $# -eq 2 ]]; then
   platform="$1"
   arch="$2"
 else
-  echo "[ERROR] Usage: $0 OR $0 <platform> <arch>" >&2
+  echo "[ERROR] Usage: $0 [--streaming] OR $0 [--streaming] <platform> <arch>" >&2
   exit 2
 fi
 
@@ -78,7 +103,7 @@ log_dir="$user_dir/logs"
 mkdir -p "$log_dir"
 log_file="$log_dir/build-chdman-$platform-$arch-$(date +%Y%m%d-%H%M%S).log"
 
-echo "[INFO] platform=$platform arch=$arch version=$version" | tee -a "$log_file"
+echo "[INFO] platform=$platform arch=$arch version=$version streaming=$streaming" | tee -a "$log_file"
 
 # ---------------------------------------------------------------------------
 # Toolchain selection per target
@@ -173,7 +198,7 @@ esac
 # present in mame/'s git objects (it must have been fetched at some point -- e.g. by
 # ever having been checked out, or by `git fetch --tags` -- but need not be HEAD now).
 # ---------------------------------------------------------------------------
-src_copy="$user_dir/_build/$platform/$arch/src"
+src_copy="$user_dir/_build/${variant_dir}$platform/$arch/src"
 rm -rf "$src_copy"
 mkdir -p "$src_copy"
 
@@ -248,6 +273,9 @@ done
 echo "[INFO] Copying wrapper sources (user/chdman_lib.*, user/osdlib_posix_min.cpp) ..." | tee -a "$log_file"
 mkdir -p "$src_copy/user"
 cp "$user_dir/chdman_lib.h" "$user_dir/chdman_lib.cpp" "$user_dir/osdlib_posix_min.cpp" "$src_copy/user/"
+if (( streaming )); then
+  cp "$user_dir/chdman_stream.cpp" "$user_dir/chdman_stream_hook.h" "$src_copy/user/"
+fi
 
 echo "[INFO] Applying chdman-simd patches ..." | tee -a "$log_file"
 cd "$src_copy"
@@ -267,6 +295,23 @@ for patch in "$submodule_root"/patches/0*.patch; do
     exit 4
   fi
 done
+
+# Streaming hook patches -- ours, kept in user/ (never in chdman-simd's own patches/), and
+# applied on top of chdman-simd's so their context is the already-patched chdman.cpp.
+if (( streaming )); then
+  echo "[INFO] Applying streaming patches (user/patches/streaming) ..." | tee -a "$log_file"
+  for patch in "$user_dir"/patches/streaming/*.patch; do
+    name="$(basename "$patch")"
+    if patch -p1 --dry-run < "$patch" >/dev/null 2>&1; then
+      patch -p1 < "$patch"
+      echo "    [OK] $name" | tee -a "$log_file"
+    else
+      echo "    [FAIL] $name -- chdman.cpp's extract write sites moved; regenerate the patch" | tee -a "$log_file"
+      echo "    [FAIL] against a scratch copy with chdman-simd's patches applied." | tee -a "$log_file"
+      exit 4
+    fi
+  done
+fi
 
 # ---------------------------------------------------------------------------
 # zlib-ng (ZLIB_COMPAT=ON), built once per platform/arch from the zlib-ng submodule.
@@ -315,9 +360,9 @@ fi
 # ---------------------------------------------------------------------------
 # Build chdman shared library
 # ---------------------------------------------------------------------------
-build_obj_dir="$user_dir/_build/$platform/$arch/obj"
-out_dir="$user_dir/release/$platform/$arch/$version/dynamic"
-include_dir="$user_dir/release/$platform/$arch/$version/include"
+build_obj_dir="$user_dir/_build/${variant_dir}$platform/$arch/obj"
+out_dir="$user_dir/release/${variant_dir}$platform/$arch/$version/dynamic"
+include_dir="$user_dir/release/${variant_dir}$platform/$arch/$version/include"
 mkdir -p "$out_dir" "$include_dir"
 
 echo "[INFO] Building chdman ($platform/$arch) ..." | tee -a "$log_file"
@@ -330,6 +375,7 @@ make -f "$user_dir/Makefile.chdman_lib" \
   UASM_BIN="${UASM_BIN:-}" \
   ZLIBNG_BUILD="$zlibng_build" \
   BUILDDIR="$build_obj_dir" \
+  STREAMING="$streaming" \
   -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" 2>&1 | tee -a "$log_file"
 
 case "$platform" in

@@ -106,7 +106,7 @@ else
 
   ifeq ($(PLATFORM),linux)
     TARGET_NAME = libchdman.so
-    SHARED_FLAG = -shared -fPIC -Wl,-z,defs
+    SHARED_FLAG = -shared -fPIC -Wl,-z,defs -Wl,--exclude-libs,ALL
     PLATFORM_LDLIBS = -lpthread -ldl -lm
   else ifeq ($(PLATFORM),mac)
     TARGET_NAME = libchdman.dylib
@@ -173,6 +173,14 @@ CFLAGS = -O3 -fPIC $(MARCH_BASE) -g \
     -DHAVE_INTTYPES_H -DHAVE_STDBOOL_H -DHAVE_FSEEKO \
     -Wall -Wextra
 
+# expat refuses to compile without a declared entropy source (xmlparse.c's #error). Windows
+# gets rand_s automatically; everywhere else /dev/urandom exists (Linux, macOS, Android,
+# iOS). Without this, only a stale xmlparse.o left in BUILDDIR from an earlier build hides
+# the error -- a fresh object dir fails.
+ifneq ($(PLATFORM),windows)
+  CFLAGS += -DXML_DEV_URANDOM
+endif
+
 EXTRA_CFLAGS ?=
 CFLAGS += $(EXTRA_CFLAGS)
 
@@ -204,6 +212,16 @@ MAIN_SRCS = \
     $(S)/tools/chdman.cpp \
     $(S)/version.cpp \
     $(U)/chdman_lib.cpp
+
+# Streaming build (build_chdman_lib.sh --streaming, which also applies
+# user/patches/streaming/*.patch to the scratch source): adds chdman_extract_stream and the
+# chdman_reader_* API (user/chdman_stream.cpp, declared in chdman_lib.h under
+# CHDMAN_WITH_STREAMING). Unset/0 = the default build, byte-for-byte as before.
+STREAMING ?= 0
+ifeq ($(STREAMING),1)
+  MAIN_SRCS += $(U)/chdman_stream.cpp
+  CXXFLAGS += -DCHDMAN_WITH_STREAMING
+endif
 
 UTIL_SRCS = \
     $(S)/lib/util/aes256cbc.cpp \
