@@ -12,9 +12,10 @@ set -euo pipefail
 # Usage:
 #   user/scripts/build_chdman_lib.sh                      # auto-detect host platform/arch
 #   user/scripts/build_chdman_lib.sh <platform> <arch>
-#   user/scripts/build_chdman_lib.sh --streaming [<platform> <arch>]
+#   user/scripts/build_chdman_lib.sh --nostreaming [<platform> <arch>]
 #
-# --streaming builds the streaming variant: additionally applies
+# Builds the streaming variant by default (--nostreaming builds the plain one; --streaming
+# is still accepted, as a no-op). The streaming variant additionally applies
 # user/patches/streaming/*.patch (write-site hook in chdman.cpp's extract loops) and
 # compiles user/chdman_stream.cpp (chdman_extract_stream + the chdman_reader_* random
 # access API, see chdman_lib.h) with -DCHDMAN_WITH_STREAMING. It uses its own scratch
@@ -29,11 +30,12 @@ set -euo pipefail
 # right toolchain already installed -- see the per-platform notes below and
 # user/docs/README.chdman-lib.md.
 
-streaming=0
+streaming=1
 args=()
 for arg in "$@"; do
   case "$arg" in
     --streaming) streaming=1 ;;
+    --nostreaming) streaming=0 ;;
     *) args+=("$arg") ;;
   esac
 done
@@ -80,7 +82,7 @@ elif [[ $# -eq 2 ]]; then
   platform="$1"
   arch="$2"
 else
-  echo "[ERROR] Usage: $0 [--streaming] OR $0 [--streaming] <platform> <arch>" >&2
+  echo "[ERROR] Usage: $0 [--nostreaming] OR $0 [--nostreaming] <platform> <arch>" >&2
   exit 2
 fi
 

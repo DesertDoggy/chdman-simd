@@ -213,7 +213,7 @@ MAIN_SRCS = \
     $(S)/version.cpp \
     $(U)/chdman_lib.cpp
 
-# Streaming build (build_chdman_lib.sh --streaming, which also applies
+# Streaming build (build_chdman_lib.sh's default -- not --nostreaming -- which also applies
 # user/patches/streaming/*.patch to the scratch source): adds chdman_extract_stream and the
 # chdman_reader_* API (user/chdman_stream.cpp, declared in chdman_lib.h under
 # CHDMAN_WITH_STREAMING). Unset/0 = the default build, byte-for-byte as before.

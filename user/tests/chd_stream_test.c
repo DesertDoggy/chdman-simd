@@ -1,4 +1,4 @@
-/* Functional test for the chdman streaming build (build_chdman_lib.sh --streaming).
+/* Functional test for the chdman streaming build (build_chdman_lib.sh's default).
  *
  * Usage: chd_stream_test <streaming lib> <default lib> <input.chd> <cd|dvd|raw> <scratch dir>
  *                        [official chdman executable]

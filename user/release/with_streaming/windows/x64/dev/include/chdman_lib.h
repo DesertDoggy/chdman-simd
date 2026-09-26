@@ -72,7 +72,7 @@ CHDMAN_API void chdman_free_log(char* log);
 #ifdef CHDMAN_WITH_STREAMING
 /*
  * ---------------------------------------------------------------------------------------
- * Streaming build only (user/scripts/build_chdman_lib.sh's default). A library exports
+ * Streaming build only (user/scripts/build_chdman_lib.sh --streaming). A library exports
  * these iff it was built that way, so callers detect support by looking up
  * chdman_extract_stream / chdman_reader_open. Nothing here changes the CHD file format.
  * ---------------------------------------------------------------------------------------
