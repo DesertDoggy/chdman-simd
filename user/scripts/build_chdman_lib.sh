@@ -87,10 +87,10 @@ else
 fi
 
 case "$platform/$arch" in
-  windows/x64|linux/x64|mac/arm64|android/arm64|ios/arm64) ;;
+  windows/x64|windows/arm64|linux/x64|linux/arm64|mac/arm64|android/arm64|ios/arm64) ;;
   *)
     echo "[ERROR] Unsupported platform/arch combination: $platform/$arch" >&2
-    echo "[ERROR] Supported: windows/x64 linux/x64 mac/arm64 android/arm64 ios/arm64" >&2
+    echo "[ERROR] Supported: windows/x64 windows/arm64 linux/x64 linux/arm64 mac/arm64 android/arm64 ios/arm64" >&2
     exit 2
     ;;
 esac
@@ -112,9 +112,22 @@ echo "[INFO] platform=$platform arch=$arch version=$version streaming=$streaming
 # ---------------------------------------------------------------------------
 MARCH_EXTRA=""
 HAVE_LZMA_ASM=0
+# Set for the cross targets below, so the zlib-ng sub-build uses the same compiler.
+zlibng_cross_args=()
 
 case "$platform" in
   windows)
+  if [[ "$arch" == "arm64" ]]; then
+    # MSYS2's MinGW64 gcc has no aarch64 target; llvm-mingw's clang does, and speaks the
+    # same GNU driver flags Makefile.chdman_lib uses (-static-libgcc/-static-libstdc++
+    # included). No LZMA ASM: the uasm path is x86_64 asm.
+    CC="${CC_WINDOWS_ARM64:-aarch64-w64-mingw32-clang}"
+    CXX="${CXX_WINDOWS_ARM64:-aarch64-w64-mingw32-clang++}"
+    AR="${AR_WINDOWS_ARM64:-llvm-ar}"
+    command -v "$CXX" >/dev/null 2>&1 || { echo "[ERROR] $CXX not found. Put llvm-mingw's bin/ on PATH (https://github.com/mstorsjo/llvm-mingw)." >&2; exit 3; }
+    zlibng_cross_args=(-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=aarch64
+      -DCMAKE_C_COMPILER="$CC" -DCMAKE_AR="$(command -v "$AR")")
+  else
     CC=gcc
     CXX=g++
     AR=ar
@@ -147,11 +160,22 @@ case "$platform" in
     else
       echo "[INFO] uasm not found on PATH -- LZMA ASM decoder disabled (C fallback)" | tee -a "$log_file"
     fi
+  fi
     ;;
   linux)
-    CC="${CC:-gcc}"
-    CXX="${CXX:-g++}"
-    AR="${AR:-ar}"
+    case "$(uname -m)" in arm64|aarch64) host_is_arm64=1 ;; *) host_is_arm64=0 ;; esac
+    if [[ "$arch" == "arm64" ]] && (( ! host_is_arm64 )); then
+      # GNU aarch64 cross toolchain (apt: g++-aarch64-linux-gnu).
+      prefix="${LINUX_ARM64_CROSS_PREFIX:-aarch64-linux-gnu-}"
+      CC="${prefix}gcc"; CXX="${prefix}g++"; AR="${prefix}ar"
+      command -v "$CXX" >/dev/null 2>&1 || { echo "[ERROR] $CXX not found. Install g++-aarch64-linux-gnu." >&2; exit 3; }
+      zlibng_cross_args=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64
+        -DCMAKE_C_COMPILER="$CC" -DCMAKE_AR="$(command -v "$AR")")
+    else
+      CC="${CC:-gcc}"
+      CXX="${CXX:-g++}"
+      AR="${AR:-ar}"
+    fi
     ;;
   mac)
     CC=clang
@@ -298,6 +322,24 @@ for patch in "$submodule_root"/patches/0*.patch; do
   fi
 done
 
+# arm64 patches -- ours, kept in user/ like the streaming ones below. chdman-simd's own
+# patches add an x86-only cpuid/xgetbv SIMD report to chdman.cpp with no architecture
+# guard; these fence it off, before the streaming patches so their context never depends
+# on which variant is being built.
+if [[ "$arch" == "arm64" ]]; then
+  echo "[INFO] Applying arm64 patches (user/patches/arm64) ..." | tee -a "$log_file"
+  for patch in "$user_dir"/patches/arm64/*.patch; do
+    name="$(basename "$patch")"
+    if patch -p1 --dry-run < "$patch" >/dev/null 2>&1; then
+      patch -p1 < "$patch"
+      echo "    [OK] $name" | tee -a "$log_file"
+    else
+      echo "    [FAIL] $name -- chdman.cpp moved under chdman-simd's patches; regenerate it" | tee -a "$log_file"
+      exit 4
+    fi
+  done
+fi
+
 # Streaming hook patches -- ours, kept in user/ (never in chdman-simd's own patches/), and
 # applied on top of chdman-simd's so their context is the already-patched chdman.cpp.
 if (( streaming )); then
@@ -343,8 +385,9 @@ if [[ ! -f "$zlibng_lib" ]]; then
 
   cmake -S "$zlibng_src" -B "$zlibng_build" -G "$cmake_generator" \
     -DZLIB_COMPAT=ON -DBUILD_SHARED_LIBS=OFF -DZLIB_ENABLE_TESTS=OFF -DWITH_GTEST=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_C_FLAGS="-O3 $MARCH_EXTRA" \
-    "${cmake_extra_args[@]}" 2>&1 | tee -a "$log_file"
+    "${cmake_extra_args[@]}" ${zlibng_cross_args[@]+"${zlibng_cross_args[@]}"} 2>&1 | tee -a "$log_file"
   # --target zlib-ng only (produces libz.a) -- the default "all" target also builds
   # zlib-ng's own dev/test utility executables (utils/CMakeLists.txt's maketrees.exe,
   # makefixed.exe, minigzip.exe, etc), which aren't needed for the static lib chdman
