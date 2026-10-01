@@ -97,9 +97,10 @@ esac
 
 # ---------------------------------------------------------------------------
 # chdman-simd's own version tag (e.g. "0.286-1-g08ea73e") -- used only for the release
-# output path; harmless if git describe is unavailable (falls back to "dev").
+# output path; if git describe finds no tag (a fresh clone of the fork has none) it falls back to a
+# build datetime, which still reads as a version directory to move_libs_to_app_root.sh.
 # ---------------------------------------------------------------------------
-version="$(git -C "$submodule_root" describe --tags 2>/dev/null || echo dev)"
+version="$(git -C "$submodule_root" describe --tags 2>/dev/null || date +%Y%m%d-%H%M%S)"
 
 log_dir="$user_dir/logs"
 mkdir -p "$log_dir"
