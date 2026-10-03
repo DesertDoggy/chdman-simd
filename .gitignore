@@ -1,2 +1,4 @@
 /user/_build
 /user/logs
+.DS_Store
+/user/release
